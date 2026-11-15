@@ -1,0 +1,29 @@
+[master]
+daemon = false
+
+[worker]
+program = "aeg-maia"
+count = 1
+
+[memory]
+initial = 1
+soft_max = 8
+hard_max = 16
+idle_timeout_secs = 60
+
+[generation]
+min_ready = 1
+ready_timeout_secs = 10
+drain_timeout_secs = 30
+kill_timeout_secs = 5
+max_draining = 2
+on_all_failed = "exit"
+
+[restart]
+max_restarts = 5
+window_secs = 60
+backoff_initial_ms = 100
+backoff_max_secs = 10
+jitter_ratio_percent = 20
+stable_after_secs = 60
+startup_failures = 3

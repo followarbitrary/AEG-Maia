@@ -1,8 +1,8 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     io::{self, Read, Write},
     process::{Child, ChildStdin, Command, Stdio},
-    sync::{mpsc, Arc},
+    sync::{mpsc, Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -19,6 +19,27 @@ use crate::{
 pub use crate::module::WorkerId;
 pub type GenerationId = u64;
 
+/// Identifies the role of a child process managed by a factory.
+///
+/// Workers are generation members and normally receive the worker control
+/// protocol. Helpers use the same command transport seam but are explicitly
+/// marked so launchers and supervisors can apply role-specific policy without
+/// inferring it from an executable name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessKind {
+    Worker,
+    Helper,
+}
+
+impl ProcessKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Worker => "worker",
+            Self::Helper => "helper",
+        }
+    }
+}
+
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +51,7 @@ pub enum FrameKind {
     Terminate = 4,
     Ready = 5,
     StartupFailed = 6,
+    ReopenLog = 7,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -43,6 +65,7 @@ impl TryFrom<u8> for FrameKind {
             4 => Ok(Self::Terminate),
             5 => Ok(Self::Ready),
             6 => Ok(Self::StartupFailed),
+            7 => Ok(Self::ReopenLog),
             other => Err(Error::Process(format!(
                 "unknown worker control frame kind: {other}"
             ))),
@@ -112,6 +135,12 @@ pub struct WorkerMetadata {
     pub worker_id: WorkerId,
     #[serde(default)]
     pub listeners: Vec<ListenerMetadata>,
+    /// Immutable listener ownership captured by the master module cycle.
+    ///
+    /// The worker must use this map when validating `claim_tcp`; listener
+    /// names are not required to match module names.
+    #[serde(default)]
+    pub listener_owners: BTreeMap<String, String>,
     pub entrypoint: Option<String>,
 }
 
@@ -140,11 +169,14 @@ pub enum WorkerCommand {
     },
     Quit,
     Terminate,
+    ReopenLog,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkerEvent {
     Ready,
+    Draining,
+    Fatal(String),
     StartupFailed(String),
     ControlChannelEof,
 }
@@ -156,9 +188,15 @@ pub trait ControlChannel: Send {
 
 pub trait WorkerHandle: Send {
     fn worker_id(&self) -> WorkerId;
+    fn process_kind(&self) -> ProcessKind {
+        ProcessKind::Worker
+    }
     fn channel(&mut self) -> &mut dyn ControlChannel;
     fn poll_exit(&mut self) -> Result<Option<ExitStatus>>;
     fn terminate(&mut self) -> Result<()>;
+    fn reopen_log(&mut self) -> Result<()> {
+        self.channel().send(WorkerCommand::ReopenLog)
+    }
     fn kill(&mut self) -> Result<()>;
 }
 
@@ -169,6 +207,7 @@ pub struct WorkerSpawnRequest {
     pub config: ConfigSnapshot,
     pub entrypoint: Option<String>,
     pub inherited_listener_fds: Vec<i32>,
+    pub listener_owners: BTreeMap<String, String>,
 }
 
 impl WorkerSpawnRequest {
@@ -187,6 +226,7 @@ impl WorkerSpawnRequest {
             generation_id: self.generation_id,
             worker_id: self.worker_id,
             listeners,
+            listener_owners: self.listener_owners.clone(),
             entrypoint: self.entrypoint.clone(),
         }
     }
@@ -194,9 +234,21 @@ impl WorkerSpawnRequest {
 
 pub trait WorkerFactory: Send + Sync {
     fn spawn(&self, request: WorkerSpawnRequest) -> Result<Box<dyn WorkerHandle>>;
+
+    /// Role assigned to children created by this factory. Existing custom
+    /// factories remain worker factories unless they opt into helpers.
+    fn process_kind(&self) -> ProcessKind {
+        ProcessKind::Worker
+    }
 }
 
 pub trait ControlChannelFactory: Send + Sync {
+    /// Configure the child transport before it is spawned.  Pipe based
+    /// transports keep the historical stdin/stdout defaults; socket based
+    /// transports override both ends with a private descriptor.
+    fn configure(&self, _command: &mut Command) -> Result<()> {
+        Ok(())
+    }
     fn create(&self, child: &mut Child) -> Result<Box<dyn ControlChannel>>;
 }
 
@@ -274,6 +326,162 @@ impl ControlChannelFactory for PipeControlChannelFactory {
     }
 }
 
+/// Unix socketpair transport used by the command worker factory by default.
+/// The protocol never shares stdout, so incidental child output cannot
+/// corrupt control frames.
+#[cfg(unix)]
+pub struct SocketPairControlChannelFactory {
+    parent: Mutex<Option<std::os::unix::net::UnixStream>>,
+    child: Mutex<Option<std::os::unix::net::UnixStream>>,
+}
+
+#[cfg(unix)]
+impl Default for SocketPairControlChannelFactory {
+    fn default() -> Self {
+        Self {
+            parent: Mutex::new(None),
+            child: Mutex::new(None),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl ControlChannelFactory for SocketPairControlChannelFactory {
+    fn configure(&self, command: &mut Command) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        let (parent, child) = std::os::unix::net::UnixStream::pair()
+            .map_err(|error| Error::Process(error.to_string()))?;
+        let fd = child.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            return Err(Error::Process(io::Error::last_os_error().to_string()));
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+            return Err(Error::Process(io::Error::last_os_error().to_string()));
+        }
+        command
+            .env("AEG_CONTROL_FD", fd.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null());
+        *self
+            .parent
+            .lock()
+            .map_err(|_| Error::Process("control transport lock poisoned".into()))? = Some(parent);
+        *self
+            .child
+            .lock()
+            .map_err(|_| Error::Process("control transport lock poisoned".into()))? = Some(child);
+        Ok(())
+    }
+
+    fn create(&self, _child: &mut Child) -> Result<Box<dyn ControlChannel>> {
+        let stream = self
+            .parent
+            .lock()
+            .map_err(|_| Error::Process("control transport lock poisoned".into()))?
+            .take()
+            .ok_or_else(|| Error::Process("socketpair transport was not configured".into()))?;
+        // Drop our copy after the child has been spawned, leaving one endpoint
+        // in the worker and one in the master.
+        let _ = self
+            .child
+            .lock()
+            .map_err(|_| Error::Process("control transport lock poisoned".into()))?
+            .take();
+        let writer = stream
+            .try_clone()
+            .map_err(|error| Error::Process(error.to_string()))?;
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || read_control_events(stream, sender));
+        Ok(Box::new(SocketPairControlChannel { writer, receiver }))
+    }
+}
+
+#[cfg(unix)]
+fn read_control_events<R: Read>(mut reader: R, sender: mpsc::Sender<WorkerEvent>) {
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                buffer.extend_from_slice(&chunk[..read]);
+                loop {
+                    match ControlFrameCodec::decode(&mut buffer) {
+                        Ok(Some((FrameKind::Ready, _))) => {
+                            let _ = sender.send(WorkerEvent::Ready);
+                        }
+                        Ok(Some((FrameKind::StartupFailed, payload))) => {
+                            let _ = sender.send(WorkerEvent::StartupFailed(
+                                String::from_utf8_lossy(&payload).into_owned(),
+                            ));
+                        }
+                        Ok(Some((_kind, _payload))) => {}
+                        Ok(None) => break,
+                        Err(error) => {
+                            let _ = sender.send(WorkerEvent::StartupFailed(error.to_string()));
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = sender.send(WorkerEvent::StartupFailed(error.to_string()));
+                return;
+            }
+        }
+    }
+    let _ = sender.send(WorkerEvent::ControlChannelEof);
+}
+
+#[cfg(unix)]
+struct SocketPairControlChannel {
+    writer: std::os::unix::net::UnixStream,
+    receiver: mpsc::Receiver<WorkerEvent>,
+}
+
+#[cfg(unix)]
+impl ControlChannel for SocketPairControlChannel {
+    fn send(&mut self, command: WorkerCommand) -> Result<()> {
+        let mut frames = Vec::new();
+        match command {
+            WorkerCommand::Configure { snapshot, metadata } => {
+                let config = toml::to_string(&snapshot)
+                    .map_err(|error| Error::Process(error.to_string()))?;
+                let metadata = toml::to_string(&metadata)
+                    .map_err(|error| Error::Process(error.to_string()))?;
+                frames.extend(ControlFrameCodec::encode(
+                    FrameKind::Config,
+                    config.as_bytes(),
+                )?);
+                frames.extend(ControlFrameCodec::encode(
+                    FrameKind::Metadata,
+                    metadata.as_bytes(),
+                )?);
+            }
+            WorkerCommand::Quit => frames.extend(ControlFrameCodec::encode(FrameKind::Quit, &[])?),
+            WorkerCommand::Terminate => {
+                frames.extend(ControlFrameCodec::encode(FrameKind::Terminate, &[])?)
+            }
+            WorkerCommand::ReopenLog => {
+                frames.extend(ControlFrameCodec::encode(FrameKind::ReopenLog, &[])?)
+            }
+        }
+        self.writer
+            .write_all(&frames)
+            .and_then(|_| self.writer.flush())
+            .map_err(|error| Error::Process(error.to_string()))
+    }
+
+    fn try_recv(&mut self) -> Result<Option<WorkerEvent>> {
+        match self.receiver.try_recv() {
+            Ok(event) => Ok(Some(event)),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => Ok(Some(WorkerEvent::ControlChannelEof)),
+        }
+    }
+}
+
 struct PipeControlChannel {
     stdin: ChildStdin,
     receiver: mpsc::Receiver<WorkerEvent>,
@@ -303,6 +511,10 @@ impl ControlChannel for PipeControlChannel {
                 .stdin
                 .write_all(&ControlFrameCodec::encode(FrameKind::Terminate, &[])?)
                 .map_err(|error| Error::Process(error.to_string()))?,
+            WorkerCommand::ReopenLog => self
+                .stdin
+                .write_all(&ControlFrameCodec::encode(FrameKind::ReopenLog, &[])?)
+                .map_err(|error| Error::Process(error.to_string()))?,
         }
         self.stdin
             .flush()
@@ -320,16 +532,56 @@ impl ControlChannel for PipeControlChannel {
 
 pub struct CommandWorkerFactory {
     transport: Arc<dyn ControlChannelFactory>,
+    kind: ProcessKind,
     process_group: bool,
+    #[cfg(unix)]
+    process_group_state: Arc<Mutex<Option<(GenerationId, libc::pid_t)>>>,
 }
 
 #[cfg(unix)]
-fn set_current_process_group() -> io::Result<()> {
-    let result = unsafe { libc::setpgid(0, 0) };
+fn set_process_group(pgid: Option<libc::pid_t>) -> io::Result<()> {
+    let result = unsafe { libc::setpgid(0, pgid.unwrap_or(0)) };
     if result == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn reset_control_signal_mask() -> io::Result<()> {
+    let mut set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    if unsafe { libc::sigemptyset(&mut set) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // The master blocks signals before forking so its signal source can
+    // consume them deterministically. A worker must start with an empty mask;
+    // clearing the complete mask avoids inheriting unrelated caller policy.
+    let result = unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &set, std::ptr::null_mut()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(result))
+    }
+}
+
+#[cfg(unix)]
+fn prepare_child_process(pgid: Option<libc::pid_t>) -> io::Result<()> {
+    reset_control_signal_mask()?;
+    match set_process_group(pgid) {
+        Ok(()) => Ok(()),
+        Err(error) if pgid.is_some() => set_process_group(None).or(Err(error)),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn child_process_group(pid: libc::pid_t) -> io::Result<libc::pid_t> {
+    let group = unsafe { libc::getpgid(pid) };
+    if group < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(group)
     }
 }
 
@@ -351,16 +603,27 @@ impl Default for CommandWorkerFactory {
 
 impl CommandWorkerFactory {
     pub fn new() -> Self {
+        #[cfg(unix)]
+        let transport: Arc<dyn ControlChannelFactory> =
+            Arc::new(SocketPairControlChannelFactory::default());
+        #[cfg(not(unix))]
+        let transport: Arc<dyn ControlChannelFactory> = Arc::new(PipeControlChannelFactory);
         Self {
-            transport: Arc::new(PipeControlChannelFactory),
+            transport,
+            kind: ProcessKind::Worker,
             process_group: false,
+            #[cfg(unix)]
+            process_group_state: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn with_transport(transport: Arc<dyn ControlChannelFactory>) -> Self {
         Self {
             transport,
+            kind: ProcessKind::Worker,
             process_group: false,
+            #[cfg(unix)]
+            process_group_state: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -368,9 +631,29 @@ impl CommandWorkerFactory {
         self.process_group = true;
         self
     }
+
+    /// Set the role used for children created by this factory.
+    pub fn with_process_kind(mut self, kind: ProcessKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Construct a command factory for helper processes. The caller can
+    /// still opt into generation process groups with `with_process_group`.
+    pub fn helper() -> Self {
+        Self::new().with_process_kind(ProcessKind::Helper)
+    }
+
+    pub const fn process_kind(&self) -> ProcessKind {
+        self.kind
+    }
 }
 
 impl WorkerFactory for CommandWorkerFactory {
+    fn process_kind(&self) -> ProcessKind {
+        self.kind
+    }
+
     fn spawn(&self, request: WorkerSpawnRequest) -> Result<Box<dyn WorkerHandle>> {
         let mut command = Command::new(&request.config.worker.program);
         command
@@ -378,6 +661,7 @@ impl WorkerFactory for CommandWorkerFactory {
             .envs(&request.config.worker.env)
             .env("AEG_GENERATION_ID", request.generation_id.to_string())
             .env("AEG_WORKER_ID", request.worker_id.to_string())
+            .env("AEG_PROCESS_KIND", self.kind.as_str())
             .env(
                 "AEG_LISTENER_FDS",
                 request
@@ -389,19 +673,52 @@ impl WorkerFactory for CommandWorkerFactory {
             )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
+        self.transport.configure(&mut command)?;
         if let Some(entrypoint) = request.entrypoint {
             command.env("AEG_WORKER_ENTRYPOINT", entrypoint);
         }
         #[cfg(unix)]
-        if self.process_group {
+        let generation_group = if self.process_group {
+            let mut state = self
+                .process_group_state
+                .lock()
+                .map_err(|_| Error::Process("process group state poisoned".into()))?;
+            if state.as_ref().map(|(generation, _)| *generation) != Some(request.generation_id) {
+                *state = Some((request.generation_id, 0));
+            }
+            state
+                .as_ref()
+                .and_then(|(_, pgid)| (*pgid != 0).then_some(*pgid))
+        } else {
+            None
+        };
+        #[cfg(unix)]
+        {
             use std::os::unix::process::CommandExt;
             unsafe {
-                command.pre_exec(set_current_process_group);
+                command.pre_exec(move || prepare_child_process(generation_group));
             }
         }
         let mut child = command
             .spawn()
             .map_err(|error| Error::Process(error.to_string()))?;
+        #[cfg(unix)]
+        let process_group = if self.process_group {
+            let mut state = self
+                .process_group_state
+                .lock()
+                .map_err(|_| Error::Process("process group state poisoned".into()))?;
+            let pgid =
+                child_process_group(child.id() as libc::pid_t).unwrap_or(child.id() as libc::pid_t);
+            if let Some((generation, current)) = state.as_mut() {
+                if *generation == request.generation_id {
+                    *current = pgid;
+                }
+            }
+            Some(pgid)
+        } else {
+            None
+        };
         let channel = match self.transport.create(&mut child) {
             Ok(channel) => channel,
             Err(error) => {
@@ -412,23 +729,31 @@ impl WorkerFactory for CommandWorkerFactory {
         };
         Ok(Box::new(CommandWorkerHandle {
             worker_id: request.worker_id,
+            kind: self.kind,
             child,
             channel,
-            process_group: self.process_group,
+            #[cfg(unix)]
+            process_group,
         }))
     }
 }
 
 struct CommandWorkerHandle {
     worker_id: WorkerId,
+    kind: ProcessKind,
     child: Child,
     channel: Box<dyn ControlChannel>,
-    process_group: bool,
+    #[cfg(unix)]
+    process_group: Option<libc::pid_t>,
 }
 
 impl WorkerHandle for CommandWorkerHandle {
     fn worker_id(&self) -> WorkerId {
         self.worker_id
+    }
+
+    fn process_kind(&self) -> ProcessKind {
+        self.kind
     }
     fn channel(&mut self) -> &mut dyn ControlChannel {
         self.channel.as_mut()
@@ -460,8 +785,8 @@ impl WorkerHandle for CommandWorkerHandle {
 
     fn kill(&mut self) -> Result<()> {
         #[cfg(unix)]
-        if self.process_group {
-            match signal_process_group(self.child.id() as libc::pid_t, libc::SIGKILL) {
+        if let Some(pgid) = self.process_group {
+            match signal_process_group(pgid, libc::SIGKILL) {
                 Ok(()) => return Ok(()),
                 Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(()),
                 Err(error) => return Err(Error::Process(error.to_string())),
@@ -753,6 +1078,29 @@ impl<F: WorkerFactory> GenerationManager<F> {
         }
     }
 
+    /// Ask every live worker to reopen its log sink. Transports that do not
+    /// implement a log sink may safely ignore the command.
+    pub fn reopen_logs(&mut self) -> Result<()> {
+        fn send(generation: &mut Generation) -> Result<()> {
+            for slot in &mut generation.workers {
+                if !slot.exited {
+                    slot.handle.reopen_log()?;
+                }
+            }
+            Ok(())
+        }
+        if let Some(generation) = self.pending.as_mut() {
+            send(generation)?;
+        }
+        if let Some(generation) = self.active.as_mut() {
+            send(generation)?;
+        }
+        for generation in &mut self.draining {
+            send(generation)?;
+        }
+        Ok(())
+    }
+
     pub fn force_shutdown(&mut self) -> Result<()> {
         self.shutdown = true;
         let mut errors = Vec::new();
@@ -811,6 +1159,7 @@ impl<F: WorkerFactory> GenerationManager<F> {
                 config: snapshot.clone(),
                 entrypoint: entrypoint.clone(),
                 inherited_listener_fds: snapshot.worker.listener_fds.clone(),
+                listener_owners: cycle.listener_owners().clone(),
             };
             let metadata = request.metadata();
             let mut handle = match self.factory.spawn(request) {
@@ -869,7 +1218,10 @@ impl<F: WorkerFactory> GenerationManager<F> {
                 if event == WorkerEvent::Ready && !slot.ready {
                     slot.ready = true;
                     slot.restart.mark_ready(now);
-                } else if event == WorkerEvent::ControlChannelEof {
+                } else if matches!(
+                    event,
+                    WorkerEvent::ControlChannelEof | WorkerEvent::Fatal(_)
+                ) {
                     slot.exited = true;
                     let _ = slot.restart.on_exit(
                         now,
@@ -945,6 +1297,7 @@ impl<F: WorkerFactory> GenerationManager<F> {
                     config: active.snapshot.clone(),
                     entrypoint: self.registry_factory.worker_entrypoint(),
                     inherited_listener_fds: active.snapshot.worker.listener_fds.clone(),
+                    listener_owners: active.cycle.listener_owners().clone(),
                 };
                 let metadata = request.metadata();
                 match self.factory.spawn(request) {
@@ -1036,7 +1389,9 @@ impl<F: WorkerFactory> GenerationManager<F> {
                         slot.restart.mark_ready(now);
                     }
                     WorkerEvent::ControlChannelEof => channel_eof = true,
+                    WorkerEvent::Fatal(_) => channel_eof = true,
                     WorkerEvent::StartupFailed(_) => channel_eof = true,
+                    WorkerEvent::Draining => {}
                     WorkerEvent::Ready => {}
                 }
             }

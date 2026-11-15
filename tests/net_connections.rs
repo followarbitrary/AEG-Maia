@@ -1,3 +1,5 @@
+#![cfg(feature = "net")]
+
 use std::{
     io::Write,
     net::TcpStream,

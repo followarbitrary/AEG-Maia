@@ -6,6 +6,8 @@ use std::{
 };
 
 use mio::event::Source;
+#[cfg(feature = "net")]
+use mio::net::TcpListener;
 
 use crate::{
     config::{ConfigSnapshot, ListenConfig},
@@ -25,6 +27,18 @@ pub struct ListenSpec {
 
 pub trait WorkerEventRegistrar: Send {
     fn claim_listener(&mut self, module: &str, name: &str) -> Result<()>;
+    /// Claim and move an inherited listener into the worker module.
+    ///
+    /// The worker event registry owns listener handles until this method is
+    /// called. This keeps raw descriptors out of configuration snapshots and
+    /// prevents a module from taking a descriptor by index or by name alone.
+    #[cfg(feature = "net")]
+    fn claim_tcp(&mut self, module: &str, name: &str) -> Result<TcpListener> {
+        let _ = (module, name);
+        Err(Error::Module(
+            "worker listener transfer is unavailable".into(),
+        ))
+    }
     fn unclaimed_listeners(&self) -> Vec<String>;
     fn claimed_listeners(&self) -> Vec<String>;
 
@@ -93,13 +107,19 @@ pub trait WorkerEventRegistrar: Send {
     }
 
     fn remove_event(&mut self, _key: EventKey) {}
+
+    fn active_event_count(&self) -> usize {
+        0
+    }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct ListenerClaims {
     owners: BTreeMap<String, String>,
     required: BTreeSet<String>,
     claimed: BTreeSet<String>,
+    #[cfg(feature = "net")]
+    listeners: BTreeMap<String, TcpListener>,
 }
 
 impl ListenerClaims {
@@ -117,7 +137,21 @@ impl ListenerClaims {
             owners,
             required: required_names,
             claimed: BTreeSet::new(),
+            #[cfg(feature = "net")]
+            listeners: BTreeMap::new(),
         }
+    }
+
+    /// Create claims backed by listener handles inherited by a worker.
+    #[cfg(feature = "net")]
+    pub fn with_listeners(
+        owners: BTreeMap<String, String>,
+        listeners: impl IntoIterator<Item = (String, TcpListener)>,
+    ) -> Self {
+        let mut claims = Self::new(owners);
+        claims.listeners.extend(listeners);
+        claims.required.extend(claims.listeners.keys().cloned());
+        claims
     }
 
     pub fn from_cycle(cycle: &ModuleCycle) -> Self {
@@ -127,6 +161,38 @@ impl ListenerClaims {
 
 impl WorkerEventRegistrar for ListenerClaims {
     fn claim_listener(&mut self, module: &str, name: &str) -> Result<()> {
+        self.claim_name(module, name)
+    }
+
+    #[cfg(feature = "net")]
+    fn claim_tcp(&mut self, module: &str, name: &str) -> Result<TcpListener> {
+        if !self.listeners.contains_key(name) {
+            return Err(Error::Module(format!(
+                "listener {name} has no inherited TCP handle"
+            )));
+        }
+        self.claim_name(module, name)?;
+        Ok(self
+            .listeners
+            .remove(name)
+            .expect("listener handle checked before claim"))
+    }
+
+    fn unclaimed_listeners(&self) -> Vec<String> {
+        self.required
+            .iter()
+            .filter(|name| !self.claimed.contains(*name))
+            .cloned()
+            .collect()
+    }
+
+    fn claimed_listeners(&self) -> Vec<String> {
+        self.claimed.iter().cloned().collect()
+    }
+}
+
+impl ListenerClaims {
+    fn claim_name(&mut self, module: &str, name: &str) -> Result<()> {
         let owner = self.owners.get(name).ok_or_else(|| {
             Error::Module(format!(
                 "module {module} attempted to claim unknown listener {name}"
@@ -143,18 +209,6 @@ impl WorkerEventRegistrar for ListenerClaims {
             )));
         }
         Ok(())
-    }
-
-    fn unclaimed_listeners(&self) -> Vec<String> {
-        self.required
-            .iter()
-            .filter(|name| !self.claimed.contains(*name))
-            .cloned()
-            .collect()
-    }
-
-    fn claimed_listeners(&self) -> Vec<String> {
-        self.claimed.iter().cloned().collect()
     }
 }
 
@@ -179,6 +233,11 @@ impl WorkerEventRegistry {
 impl WorkerEventRegistrar for WorkerEventRegistry {
     fn claim_listener(&mut self, module: &str, name: &str) -> Result<()> {
         self.claims.claim_listener(module, name)
+    }
+
+    #[cfg(feature = "net")]
+    fn claim_tcp(&mut self, module: &str, name: &str) -> Result<TcpListener> {
+        self.claims.claim_tcp(module, name)
     }
 
     fn unclaimed_listeners(&self) -> Vec<String> {
@@ -259,6 +318,15 @@ impl WorkerEventRegistrar for WorkerEventRegistry {
 
     fn remove_event(&mut self, key: EventKey) {
         self.dispatcher.remove_key(key);
+    }
+
+    fn active_event_count(&self) -> usize {
+        // Listener registrations remain in place during a graceful drain so
+        // they can reject new accepts.  Only registrations beyond claimed
+        // listeners represent live connection handlers.
+        self.dispatcher
+            .registration_count()
+            .saturating_sub(self.claims.claimed.len())
     }
 }
 
@@ -387,6 +455,16 @@ impl WorkerContext<'_> {
             .as_deref()
             .ok_or_else(|| Error::Module("worker context has no current module".into()))?;
         self.event_registrar.claim_listener(module, name)
+    }
+
+    /// Claim an inherited TCP listener and take ownership of its handle.
+    #[cfg(feature = "net")]
+    pub fn claim_tcp(&mut self, name: &str) -> Result<TcpListener> {
+        let module = self
+            .current_module
+            .as_deref()
+            .ok_or_else(|| Error::Module("worker context has no current module".into()))?;
+        self.event_registrar.claim_tcp(module, name)
     }
 
     pub fn register_source<S: Source>(
@@ -650,6 +728,14 @@ impl ModuleCycle {
         &self.order
     }
 
+    /// Return the master-derived listener ownership table for worker startup.
+    ///
+    /// Workers receive this immutable snapshot as metadata and never replay
+    /// master `init_module` hooks just to reconstruct ownership.
+    pub fn listener_owners(&self) -> &BTreeMap<String, String> {
+        &self.listener_owners
+    }
+
     pub fn listeners(&self) -> &[ListenSpec] {
         &self.listeners
     }
@@ -871,6 +957,10 @@ impl WorkerCycle {
 
     pub fn set_draining(&mut self, draining: bool) {
         self.event_registrar.set_draining(draining);
+    }
+
+    pub fn has_active_handlers(&self) -> bool {
+        self.event_registrar.active_event_count() > 0
     }
 
     pub fn start(&mut self) -> Result<()> {

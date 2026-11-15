@@ -57,6 +57,9 @@ fn metadata_carries_generation_worker_and_ordered_listener_fds() {
             name: "http.main".into(),
             fd: 17,
         }],
+        listener_owners: [("http.main".to_owned(), "http".to_owned())]
+            .into_iter()
+            .collect(),
         entrypoint: Some("internal-worker".into()),
     };
     let encoded = toml::to_string(&metadata).unwrap();

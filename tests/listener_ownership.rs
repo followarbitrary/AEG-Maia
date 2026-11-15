@@ -142,6 +142,10 @@ fn rejects_non_owner_duplicate_and_unclaimed_worker_claims() {
         .unwrap();
     let mut cycle = registry.build_cycle().unwrap();
     cycle.init_module().unwrap();
+    assert_eq!(
+        cycle.listener_owners().get("main").map(String::as_str),
+        Some("owner")
+    );
 
     let snapshot = config();
     let mut non_owner = cycle

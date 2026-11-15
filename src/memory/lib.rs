@@ -16,6 +16,30 @@ pub trait PoolFactory<T> {
     fn reset(&mut self, value: &mut T) -> Result<()>;
 }
 
+/// Policy used when a pool has no idle object and reached its hard limit.
+///
+/// Pools are deliberately non-blocking. `Error` is the default and returns a
+/// memory error immediately; `Drop` is provided for callers that want to make
+/// that policy explicit at the call site (it has the same non-blocking
+/// behavior because a checkout has no value to drop).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Exhausted {
+    #[default]
+    Error,
+    Drop,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PoolStats {
+    pub total: usize,
+    pub idle: usize,
+    pub in_use: usize,
+    pub created: u64,
+    pub destroyed: u64,
+    pub checkouts: u64,
+    pub exhausted: u64,
+}
+
 struct Idle<T> {
     value: T,
     available_at: Instant,
@@ -26,6 +50,10 @@ struct PoolState<T, F> {
     factory: F,
     idle: VecDeque<Idle<T>>,
     total: usize,
+    created: u64,
+    destroyed: u64,
+    checkouts: u64,
+    exhausted: u64,
 }
 
 pub struct Pool<T, F> {
@@ -56,6 +84,10 @@ impl<T, F: PoolFactory<T>> Pool<T, F> {
                 factory,
                 idle,
                 total,
+                created: total as u64,
+                destroyed: 0,
+                checkouts: 0,
+                exhausted: 0,
             })),
         })
     }
@@ -66,12 +98,15 @@ impl<T, F: PoolFactory<T>> Pool<T, F> {
             idle.value
         } else {
             if state.total >= state.config.hard_max {
+                state.exhausted += 1;
                 return Err(Error::Memory("pool exhausted at hard_max".into()));
             }
             let value = state.factory.create()?;
             state.total += 1;
+            state.created += 1;
             value
         };
+        state.checkouts += 1;
         drop(state);
         Ok(PoolGuard {
             state: Rc::clone(&self.state),
@@ -96,6 +131,7 @@ impl<T, F: PoolFactory<T>> Pool<T, F> {
             removed += 1;
         }
         state.total -= removed;
+        state.destroyed += removed as u64;
         Ok(removed)
     }
 
@@ -109,6 +145,19 @@ impl<T, F: PoolFactory<T>> Pool<T, F> {
 
     pub fn idle_len(&self) -> usize {
         self.state.borrow().idle.len()
+    }
+
+    pub fn stats(&self) -> PoolStats {
+        let state = self.state.borrow();
+        PoolStats {
+            total: state.total,
+            idle: state.idle.len(),
+            in_use: state.total.saturating_sub(state.idle.len()),
+            created: state.created,
+            destroyed: state.destroyed,
+            checkouts: state.checkouts,
+            exhausted: state.exhausted,
+        }
     }
 }
 
@@ -140,6 +189,7 @@ impl<T, F: PoolFactory<T>> Drop for PoolGuard<T, F> {
         if state.factory.reset(&mut value).is_ok() {
             if state.total > state.config.soft_max {
                 state.total = state.total.saturating_sub(1);
+                state.destroyed += 1;
             } else {
                 state.idle.push_back(Idle {
                     value,
@@ -148,6 +198,7 @@ impl<T, F: PoolFactory<T>> Drop for PoolGuard<T, F> {
             }
         } else {
             state.total = state.total.saturating_sub(1);
+            state.destroyed += 1;
         }
     }
 }

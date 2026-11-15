@@ -47,8 +47,46 @@ pub struct WorkerConfig {
     pub env: BTreeMap<String, String>,
     #[serde(default = "default_worker_count")]
     pub count: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub listener_fds: Vec<i32>,
+    #[serde(default)]
+    pub net: WorkerNetConfig,
+}
+
+/// Configuration passed to network worker modules. Keeping this nested under
+/// `worker` makes the module's limits explicit in the snapshot instead of
+/// silently relying on runtime defaults.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerNetConfig {
+    #[serde(default = "default_net_max_write_queue")]
+    pub max_write_queue: usize,
+    #[serde(default = "default_net_max_read_buffer")]
+    pub max_read_buffer: usize,
+    #[serde(default = "default_net_max_total_write_queue")]
+    pub max_total_write_queue: usize,
+    #[serde(default = "default_net_high_watermark")]
+    pub high_watermark: usize,
+    #[serde(default = "default_net_low_watermark")]
+    pub low_watermark: usize,
+    #[serde(default)]
+    pub idle_timeout_secs: u64,
+    #[serde(default)]
+    pub write_timeout_secs: u64,
+}
+
+impl Default for WorkerNetConfig {
+    fn default() -> Self {
+        Self {
+            max_write_queue: default_net_max_write_queue(),
+            max_read_buffer: default_net_max_read_buffer(),
+            max_total_write_queue: default_net_max_total_write_queue(),
+            high_watermark: default_net_high_watermark(),
+            low_watermark: default_net_low_watermark(),
+            idle_timeout_secs: 0,
+            write_timeout_secs: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -57,6 +95,7 @@ pub struct GenerationConfig {
     pub ready_timeout_secs: u64,
     pub drain_timeout_secs: u64,
     pub kill_timeout_secs: u64,
+    pub handoff_timeout_secs: u64,
     pub max_draining: usize,
     pub on_all_failed: OnAllFailed,
 }
@@ -144,6 +183,8 @@ struct RawGenerationConfig {
     drain_timeout_secs: u64,
     #[serde(default = "default_kill_timeout_secs")]
     kill_timeout_secs: u64,
+    #[serde(default = "default_handoff_timeout_secs", alias = "handoff_timeout")]
+    handoff_timeout_secs: u64,
     #[serde(default = "default_max_draining")]
     max_draining: usize,
     #[serde(default = "default_on_all_failed")]
@@ -157,6 +198,7 @@ impl Default for RawGenerationConfig {
             ready_timeout_secs: default_ready_timeout_secs(),
             drain_timeout_secs: default_drain_timeout_secs(),
             kill_timeout_secs: default_kill_timeout_secs(),
+            handoff_timeout_secs: default_handoff_timeout_secs(),
             max_draining: default_max_draining(),
             on_all_failed: default_on_all_failed(),
         }
@@ -281,6 +323,7 @@ impl ConfigSnapshot {
                 ready_timeout_secs: raw.generation.ready_timeout_secs,
                 drain_timeout_secs: raw.generation.drain_timeout_secs,
                 kill_timeout_secs: raw.generation.kill_timeout_secs,
+                handoff_timeout_secs: raw.generation.handoff_timeout_secs,
                 max_draining: raw.generation.max_draining,
                 on_all_failed: raw.generation.on_all_failed,
             },
@@ -353,6 +396,16 @@ impl ConfigSnapshot {
                 "memory.hard_max must be greater than zero".into(),
             ));
         }
+        if self.worker.net.max_write_queue == 0
+            || self.worker.net.max_read_buffer == 0
+            || self.worker.net.max_total_write_queue == 0
+            || self.worker.net.low_watermark > self.worker.net.high_watermark
+            || self.worker.net.high_watermark > self.worker.net.max_write_queue
+        {
+            return Err(Error::Config(
+                "worker.net has invalid read buffer or write queue limits".into(),
+            ));
+        }
         if self.restart.max_restarts == 0 || self.restart.window_secs == 0 {
             return Err(Error::Config(
                 "restart budget and window must be greater than zero".into(),
@@ -377,9 +430,12 @@ impl ConfigSnapshot {
                 "generation.max_draining must be greater than zero".into(),
             ));
         }
-        if self.generation.ready_timeout_secs == 0 || self.generation.kill_timeout_secs == 0 {
+        if self.generation.ready_timeout_secs == 0
+            || self.generation.kill_timeout_secs == 0
+            || self.generation.handoff_timeout_secs == 0
+        {
             return Err(Error::Config(
-                "ready_timeout_secs and kill_timeout_secs must be greater than zero".into(),
+                "ready_timeout_secs, kill_timeout_secs, and handoff_timeout_secs must be greater than zero".into(),
             ));
         }
         Ok(())
@@ -414,6 +470,9 @@ const fn default_drain_timeout_secs() -> u64 {
 const fn default_kill_timeout_secs() -> u64 {
     5
 }
+const fn default_handoff_timeout_secs() -> u64 {
+    10
+}
 const fn default_max_draining() -> usize {
     2
 }
@@ -440,6 +499,21 @@ const fn default_stable_after_secs() -> u64 {
 }
 const fn default_startup_failures() -> u32 {
     3
+}
+const fn default_net_max_write_queue() -> usize {
+    1024 * 1024
+}
+const fn default_net_max_read_buffer() -> usize {
+    16 * 1024
+}
+const fn default_net_max_total_write_queue() -> usize {
+    8 * 1024 * 1024
+}
+const fn default_net_high_watermark() -> usize {
+    768 * 1024
+}
+const fn default_net_low_watermark() -> usize {
+    256 * 1024
 }
 
 #[cfg(test)]
@@ -550,6 +624,24 @@ mod tests {
         .expect("valid extended config");
         assert_eq!(snapshot.worker.listener_fds, vec![3, 4]);
         assert_eq!(snapshot.generation.on_all_failed, OnAllFailed::Keep);
+    }
+
+    #[test]
+    fn parses_module_scoped_network_limits() {
+        let snapshot = ConfigSnapshot::from_toml(
+            r#"
+                [worker]
+                program = "/bin/worker"
+                [worker.net]
+                max_write_queue = 8192
+                max_read_buffer = 4096
+                high_watermark = 6144
+                low_watermark = 2048
+            "#,
+        )
+        .expect("network limits are valid");
+        assert_eq!(snapshot.worker.net.max_write_queue, 8192);
+        assert_eq!(snapshot.worker.net.max_read_buffer, 4096);
     }
 
     #[test]

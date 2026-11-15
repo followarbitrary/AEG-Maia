@@ -139,3 +139,26 @@ fn soft_max_discards_excess_idle_objects_after_a_burst() {
     assert_eq!(pool.len(), 1);
     assert_eq!(pool.idle_len(), 1);
 }
+
+#[test]
+fn stats_report_checkout_exhaustion_and_destruction() {
+    let pool = Pool::new(
+        config(0, 0, 1),
+        Factory {
+            next: 1,
+            reset_calls: Cell::new(0),
+            fail_reset: false,
+        },
+    )
+    .unwrap();
+    let guard = pool.checkout().unwrap();
+    assert_eq!(pool.stats().in_use, 1);
+    assert_eq!(pool.stats().checkouts, 1);
+    assert!(pool.checkout().is_err());
+    assert_eq!(pool.stats().exhausted, 1);
+    drop(guard);
+    let stats = pool.stats();
+    assert_eq!(stats.total, 0);
+    assert_eq!(stats.idle, 0);
+    assert_eq!(stats.destroyed, 1);
+}

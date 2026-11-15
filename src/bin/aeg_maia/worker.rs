@@ -1,9 +1,13 @@
 use std::{
+    collections::BTreeMap,
     io::{self, Read, Write},
     sync::mpsc,
     thread,
     time::Duration,
 };
+
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
 
 use aeg_maia::{
     ConfigSnapshot, ControlFrameCodec, Error, FrameKind, ListenerClaims, ModuleRegistryFactory,
@@ -13,10 +17,25 @@ use aeg_maia::{
 use super::modules::{ReferenceRegistryFactory, ReferenceWorkerFactory};
 
 pub fn run_worker() -> aeg_maia::Result<()> {
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut input = stdin.lock();
-    let mut output = stdout.lock();
+    #[cfg(unix)]
+    if let Ok(raw_fd) = std::env::var("AEG_CONTROL_FD") {
+        let fd = raw_fd
+            .parse::<std::os::fd::RawFd>()
+            .map_err(|error| Error::Process(format!("invalid AEG_CONTROL_FD: {error}")))?;
+        let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+        let input = stream
+            .try_clone()
+            .map_err(|error| Error::Process(error.to_string()))?;
+        return run_worker_io(input, stream);
+    }
+    run_worker_io(io::stdin(), io::stdout())
+}
+
+fn run_worker_io<R, W>(mut input: R, mut output: W) -> aeg_maia::Result<()>
+where
+    R: Read + Send + 'static,
+    W: Write,
+{
     let startup = match read_startup_frames(&mut input) {
         Ok(startup) => startup,
         Err(error) => {
@@ -34,10 +53,25 @@ pub fn run_worker() -> aeg_maia::Result<()> {
     }
 
     let registry = ReferenceRegistryFactory.build(&startup.0)?;
-    let mut master_cycle = registry.build_cycle()?;
-    master_cycle.init_module()?;
-    let registrar = ListenerClaims::from_cycle(&master_cycle);
-    let mut worker = master_cycle.build_worker_with_registrar(
+    let worker_cycle = registry.build_cycle()?;
+    // Worker startup must not replay master-side init_module hooks.  Listener
+    // ownership comes from the immutable metadata snapshot, so a listener
+    // name is not required to equal its module name.
+    let owners = if startup.1.listener_owners.is_empty() {
+        // Metadata produced by older masters did not carry the owner table.
+        // Keep that wire format readable for the reference one-module-per-
+        // listener binary while all new masters send the explicit map.
+        startup
+            .1
+            .listeners
+            .iter()
+            .map(|listener| (listener.name.clone(), listener.name.clone()))
+            .collect::<BTreeMap<_, _>>()
+    } else {
+        startup.1.listener_owners.clone()
+    };
+    let registrar = ListenerClaims::with_listeners(owners, inherited_listeners(&startup.1)?);
+    let mut worker = worker_cycle.build_worker_with_registrar(
         &ReferenceWorkerFactory,
         startup.1.worker_id,
         &startup.0,
@@ -73,40 +107,79 @@ pub fn run_worker() -> aeg_maia::Result<()> {
         return Err(error);
     }
     write_frame(&mut output, FrameKind::Ready, &[])?;
-    drop(output);
-    drop(input);
-
     let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || read_commands(stdin, sender));
+    thread::spawn(move || read_commands(input, sender));
+    let mut draining = false;
     loop {
         for event in worker.poll_events(Some(Duration::from_millis(50)))? {
             worker.dispatch_event(event)?;
         }
-        let Some(command) = receiver.try_iter().next() else {
-            continue;
-        };
-        match command? {
-            FrameKind::Quit => {
-                worker.set_draining(true);
-                worker.stop()?;
-                worker.unregister_events();
-                worker.exit_process()?;
-                return Ok(());
-            }
-            FrameKind::Terminate => {
-                worker.set_draining(false);
-                worker.unregister_events();
-                let _ = worker.stop();
-                let _ = worker.exit_process();
-                return Ok(());
-            }
-            other => {
-                let error = Error::Process(format!("unexpected worker command frame: {other:?}"));
-                let _ = write_startup_failed(&mut io::stdout(), &error);
-                return Err(error);
+        for command in receiver.try_iter() {
+            let command = match command {
+                Ok(command) => command,
+                Err(_error) if draining => {
+                    worker.unregister_events();
+                    let _ = worker.exit_process();
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            match command {
+                FrameKind::Quit if !draining => {
+                    worker.set_draining(true);
+                    worker.stop()?;
+                    draining = true;
+                }
+                FrameKind::Terminate => {
+                    worker.set_draining(false);
+                    worker.unregister_events();
+                    let _ = worker.stop();
+                    let _ = worker.exit_process();
+                    return Ok(());
+                }
+                FrameKind::ReopenLog => {}
+                other => {
+                    let error =
+                        Error::Process(format!("unexpected worker command frame: {other:?}"));
+                    let _ = write_startup_failed(&mut output, &error);
+                    return Err(error);
+                }
             }
         }
+        if draining && !worker.has_active_handlers() {
+            worker.unregister_events();
+            worker.exit_process()?;
+            return Ok(());
+        }
     }
+}
+
+#[cfg(unix)]
+fn inherited_listeners(
+    metadata: &WorkerMetadata,
+) -> aeg_maia::Result<Vec<(String, mio::net::TcpListener)>> {
+    use std::os::fd::FromRawFd;
+    metadata
+        .listeners
+        .iter()
+        .map(|listener| {
+            let std_listener = unsafe { std::net::TcpListener::from_raw_fd(listener.fd) };
+            std_listener
+                .set_nonblocking(true)
+                .map_err(|error| Error::Process(error.to_string()))?;
+            Ok((
+                listener.name.clone(),
+                mio::net::TcpListener::from_std(std_listener),
+            ))
+        })
+        .collect()
+}
+
+#[cfg(not(unix))]
+fn inherited_listeners(
+    _metadata: &WorkerMetadata,
+) -> aeg_maia::Result<Vec<(String, mio::net::TcpListener)>> {
+    Err(Error::Process("inherited listeners require Unix".into()))
 }
 
 fn validate_listener_fds(metadata: &WorkerMetadata) -> aeg_maia::Result<()> {
@@ -197,6 +270,21 @@ fn validate_metadata(config: &ConfigSnapshot, metadata: &WorkerMetadata) -> aeg_
                 "worker listener metadata mismatch: expected {}, got {}",
                 configured.name, received.name
             )));
+        }
+    }
+    if !metadata.listener_owners.is_empty() {
+        if metadata.listener_owners.len() != metadata.listeners.len() {
+            return Err(Error::Process(
+                "worker listener owner metadata count does not match listeners".into(),
+            ));
+        }
+        for listener in &metadata.listeners {
+            if !metadata.listener_owners.contains_key(&listener.name) {
+                return Err(Error::Process(format!(
+                    "worker listener metadata has no owner for {}",
+                    listener.name
+                )));
+            }
         }
     }
     Ok(())

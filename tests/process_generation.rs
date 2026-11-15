@@ -7,7 +7,7 @@ use aeg_maia::{
     module::{Module, ModuleContext, ModuleRegistry},
     process::{
         ControlChannel, ExitStatus, GenerationManager, ModuleRegistryFactory, ProcessEvent,
-        WorkerCommand, WorkerEvent, WorkerFactory, WorkerHandle, WorkerSpawnRequest,
+        ProcessKind, WorkerCommand, WorkerEvent, WorkerFactory, WorkerHandle, WorkerSpawnRequest,
     },
     Error, Result,
 };
@@ -18,6 +18,19 @@ struct FakeWorkerState {
     commands: Vec<WorkerCommand>,
     exit: Option<ExitStatus>,
     killed: bool,
+}
+
+#[test]
+fn command_factory_exposes_explicit_helper_process_kind() {
+    assert_eq!(
+        aeg_maia::CommandWorkerFactory::new().process_kind(),
+        ProcessKind::Worker
+    );
+    assert_eq!(
+        aeg_maia::CommandWorkerFactory::helper().process_kind(),
+        ProcessKind::Helper
+    );
+    assert_eq!(ProcessKind::Helper.as_str(), "helper");
 }
 
 type SharedWorkerState = Arc<Mutex<FakeWorkerState>>;
@@ -270,6 +283,7 @@ fn cutover_quits_old_generation_and_drains_then_retires_it() {
                     generation_id: 1,
                     worker_id: 0,
                     listeners: Vec::new(),
+                    listener_owners: Default::default(),
                     entrypoint: None,
                 },
             },
@@ -286,6 +300,7 @@ fn cutover_quits_old_generation_and_drains_then_retires_it() {
                     generation_id: 1,
                     worker_id: 0,
                     listeners: Vec::new(),
+                    listener_owners: Default::default(),
                     entrypoint: None,
                 },
             },

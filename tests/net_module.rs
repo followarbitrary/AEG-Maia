@@ -1,3 +1,5 @@
+#![cfg(feature = "net")]
+
 use std::{
     net::TcpStream,
     sync::{Arc, Mutex},

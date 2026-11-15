@@ -1,6 +1,10 @@
 use std::{
     io::Write,
     net::TcpStream,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -95,4 +99,39 @@ fn module_event_exposes_error_and_hup_flags() {
     assert_eq!(event.key(), EventKey::from_raw(7));
     assert!(event.is_error());
     assert!(event.is_hup());
+}
+
+#[test]
+fn posted_command_wakes_poll_and_runs_on_dispatcher_thread() {
+    let mut dispatcher = EventDispatcher::new(8).unwrap();
+    let observed = Arc::new(AtomicBool::new(false));
+    let posted = Arc::clone(&observed);
+    let post = dispatcher.post_handle();
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(10));
+        post.post(move |_dispatcher| {
+            posted.store(true, Ordering::Release);
+        })
+        .unwrap();
+    });
+    let events = dispatcher.poll(Some(Duration::from_secs(1))).unwrap();
+    handle.join().unwrap();
+    assert!(events.is_empty());
+    assert!(observed.load(Ordering::Acquire));
+}
+
+#[test]
+fn scheduled_timeout_is_returned_as_a_module_event() {
+    let mut dispatcher = EventDispatcher::new(8).unwrap();
+    let (mut reader, _writer) = UnixStream::pair().unwrap();
+    let key = dispatcher
+        .register_source("module", &mut reader, EventInterest::readable())
+        .unwrap();
+    dispatcher
+        .schedule_timeout(key, Duration::from_millis(10))
+        .unwrap();
+    let events = dispatcher.poll(Some(Duration::from_secs(1))).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].key(), key);
+    assert!(events[0].is_timeout());
 }

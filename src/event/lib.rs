@@ -1,9 +1,15 @@
+use std::cell::RefCell;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
-use std::{collections::BTreeMap, io, net::SocketAddr, time::Duration};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    io,
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 use mio::{event::Source, net::TcpListener, Events, Interest, Poll, Registry, Token, Waker};
 
@@ -67,6 +73,7 @@ pub struct ModuleEvent {
     writable: bool,
     error: bool,
     hup: bool,
+    timeout: bool,
 }
 
 impl ModuleEvent {
@@ -83,6 +90,18 @@ impl ModuleEvent {
             writable,
             error,
             hup,
+            timeout: false,
+        }
+    }
+
+    pub const fn timeout(key: EventKey) -> Self {
+        Self {
+            key,
+            readable: false,
+            writable: false,
+            error: false,
+            hup: false,
+            timeout: true,
         }
     }
 
@@ -104,6 +123,10 @@ impl ModuleEvent {
 
     pub const fn is_hup(self) -> bool {
         self.hup
+    }
+
+    pub const fn is_timeout(self) -> bool {
+        self.timeout
     }
 }
 
@@ -142,6 +165,38 @@ pub struct EventDispatcher {
     registrations: BTreeMap<EventKey, Registration>,
     next_key: usize,
     draining: bool,
+    waker: Arc<Waker>,
+    commands: Arc<Mutex<VecDeque<EventCommand>>>,
+    timers: BTreeMap<Instant, Vec<EventKey>>,
+    raw_sources: RefCell<BTreeMap<Token, usize>>,
+}
+
+type EventCommand = Box<dyn FnOnce(&mut EventDispatcher) + Send + 'static>;
+
+#[derive(Clone)]
+pub struct EventPostHandle {
+    waker: Arc<Waker>,
+    commands: Arc<Mutex<VecDeque<EventCommand>>>,
+}
+
+impl EventPostHandle {
+    /// Wake the owning event loop without enqueueing a command.
+    pub fn wake(&self) -> Result<()> {
+        self.waker
+            .wake()
+            .map_err(|error| Error::Event(error.to_string()))
+    }
+
+    pub fn post<F>(&self, command: F) -> Result<()>
+    where
+        F: FnOnce(&mut EventDispatcher) + Send + 'static,
+    {
+        self.commands
+            .lock()
+            .map_err(|_| Error::Event("event command queue poisoned".into()))?
+            .push_back(Box::new(command));
+        self.wake()
+    }
 }
 
 pub struct EventContext<'a> {
@@ -157,6 +212,32 @@ impl EventContext<'_> {
 
     pub fn is_draining(&self) -> bool {
         self.dispatcher.is_draining()
+    }
+
+    pub fn post<F>(&self, command: F) -> Result<()>
+    where
+        F: FnOnce(&mut EventDispatcher) + Send + 'static,
+    {
+        self.dispatcher.post(command)
+    }
+
+    pub fn schedule_timeout(&mut self, after: Duration) -> Result<()> {
+        self.dispatcher.schedule_timeout(self.key, after)
+    }
+
+    pub fn schedule_timeout_for(&mut self, key: EventKey, after: Duration) -> Result<()> {
+        self.ensure_owner(key)?;
+        self.dispatcher.schedule_timeout(key, after)
+    }
+
+    pub fn cancel_timeout(&mut self) {
+        self.dispatcher.cancel_timeout(self.key);
+    }
+
+    pub fn cancel_timeout_for(&mut self, key: EventKey) -> Result<()> {
+        self.ensure_owner(key)?;
+        self.dispatcher.cancel_timeout(key);
+        Ok(())
     }
 
     pub fn error_count(&self) -> u64 {
@@ -235,13 +316,157 @@ impl EventDispatcher {
                 "event capacity must be greater than zero".into(),
             ));
         }
+        let poll = Poll::new().map_err(|error| Error::Event(error.to_string()))?;
+        let waker = Arc::new(
+            Waker::new(poll.registry(), Token(usize::MAX - 1))
+                .map_err(|error| Error::Event(error.to_string()))?,
+        );
+        let commands = Arc::new(Mutex::new(VecDeque::new()));
         Ok(Self {
-            poll: Poll::new().map_err(|error| Error::Event(error.to_string()))?,
+            poll,
             events: Events::with_capacity(capacity),
             registrations: BTreeMap::new(),
             next_key: 1,
             draining: false,
+            waker,
+            commands,
+            timers: BTreeMap::new(),
+            raw_sources: RefCell::new(BTreeMap::new()),
         })
+    }
+
+    /// Expose the shared mio registry for adapters that need the low-level
+    /// source API. All polling still happens through this dispatcher.
+    pub fn registry(&self) -> &Registry {
+        self.poll.registry()
+    }
+
+    pub fn post_handle(&self) -> EventPostHandle {
+        EventPostHandle {
+            waker: Arc::clone(&self.waker),
+            commands: Arc::clone(&self.commands),
+        }
+    }
+
+    pub fn post<F>(&self, command: F) -> Result<()>
+    where
+        F: FnOnce(&mut EventDispatcher) + Send + 'static,
+    {
+        self.post_handle().post(command)
+    }
+
+    fn raw_source_id<S: Source + ?Sized>(source: &mut S) -> usize {
+        source as *mut S as *mut () as usize
+    }
+
+    /// Register a legacy/raw mio source on the same poller used by module
+    /// events. This is used only by the compatibility `EventLoop` facade.
+    fn register_raw_source<S: Source + ?Sized>(
+        &self,
+        source: &mut S,
+        token: Token,
+        interests: Interest,
+    ) -> Result<()> {
+        if token == STOP_TOKEN || token == Token(usize::MAX - 1) {
+            return Err(Error::Event("the event-loop wake token is reserved".into()));
+        }
+        if self.raw_sources.borrow().contains_key(&token)
+            || self
+                .registrations
+                .contains_key(&EventKey::from_raw(token.0))
+        {
+            return Err(Error::Event(format!(
+                "event token already registered: {token:?}"
+            )));
+        }
+        self.poll
+            .registry()
+            .register(source, token, interests)
+            .map_err(|error| Error::Event(error.to_string()))?;
+        self.raw_sources
+            .borrow_mut()
+            .insert(token, Self::raw_source_id(source));
+        Ok(())
+    }
+
+    fn reregister_raw_source<S: Source + ?Sized>(
+        &self,
+        source: &mut S,
+        token: Token,
+        interests: Interest,
+    ) -> Result<()> {
+        if !self.raw_sources.borrow().contains_key(&token) {
+            return Err(Error::Event(format!("unknown event token: {token:?}")));
+        }
+        self.poll
+            .registry()
+            .reregister(source, token, interests)
+            .map_err(|error| Error::Event(error.to_string()))
+    }
+
+    fn deregister_raw_source<S: Source + ?Sized>(&self, source: &mut S) -> Result<()> {
+        let source_id = Self::raw_source_id(source);
+        let token = self
+            .raw_sources
+            .borrow()
+            .iter()
+            .find_map(|(token, id)| (*id == source_id).then_some(*token))
+            .ok_or_else(|| Error::Event("unknown raw event source".into()))?;
+        self.poll
+            .registry()
+            .deregister(source)
+            .map_err(|error| Error::Event(error.to_string()))?;
+        self.raw_sources.borrow_mut().remove(&token);
+        Ok(())
+    }
+
+    fn poll_raw(&mut self, timeout: Option<Duration>) -> Result<Vec<mio::event::Event>> {
+        self.apply_posted_commands();
+        self.poll
+            .poll(&mut self.events, timeout)
+            .map_err(|error| Error::Event(error.to_string()))?;
+        Ok(self
+            .events
+            .iter()
+            .filter(|event| event.token() != Token(usize::MAX - 1))
+            .cloned()
+            .collect())
+    }
+
+    pub fn schedule_timeout(&mut self, key: EventKey, after: Duration) -> Result<()> {
+        if !self.registrations.contains_key(&key) {
+            return Err(Error::Event(format!("unknown event key: {}", key.raw())));
+        }
+        self.cancel_timeout(key);
+        self.timers
+            .entry(
+                Instant::now()
+                    .checked_add(after)
+                    .unwrap_or_else(Instant::now),
+            )
+            .or_default()
+            .push(key);
+        Ok(())
+    }
+
+    pub fn cancel_timeout(&mut self, key: EventKey) {
+        self.timers.retain(|_, keys| {
+            keys.retain(|candidate| *candidate != key);
+            !keys.is_empty()
+        });
+    }
+
+    fn apply_posted_commands(&mut self) {
+        let commands = self
+            .commands
+            .lock()
+            .ok()
+            .map(|mut queue| queue.drain(..).collect::<Vec<_>>());
+        if let Some(commands) = commands {
+            for command in commands {
+                command(self);
+            }
+        }
     }
 
     pub fn set_draining(&mut self, draining: bool) {
@@ -266,11 +491,19 @@ impl EventDispatcher {
     }
 
     pub fn poll(&mut self, timeout: Option<Duration>) -> Result<Vec<ModuleEvent>> {
-        self.poll
-            .poll(&mut self.events, timeout)
-            .map_err(|error| Error::Event(error.to_string()))?;
+        self.apply_posted_commands();
+        let timer_timeout = self
+            .timers
+            .keys()
+            .next()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        let timeout = match (timeout, timer_timeout) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (None, Some(timer)) => Some(timer),
+            (other, None) => other,
+        };
         let mut ready = Vec::new();
-        for event in self.events.iter() {
+        for event in self.poll_raw(timeout)? {
             let key = EventKey(event.token().0);
             if !self.registrations.contains_key(&key) {
                 continue;
@@ -282,6 +515,23 @@ impl EventDispatcher {
                 event.is_error(),
                 event.is_read_closed() || event.is_write_closed(),
             ));
+        }
+        self.apply_posted_commands();
+        let now = Instant::now();
+        let due = self
+            .timers
+            .keys()
+            .take_while(|deadline| **deadline <= now)
+            .copied()
+            .collect::<Vec<_>>();
+        for deadline in due {
+            if let Some(keys) = self.timers.remove(&deadline) {
+                for key in keys {
+                    if self.registrations.contains_key(&key) {
+                        ready.push(ModuleEvent::timeout(key));
+                    }
+                }
+            }
         }
         ready.sort_by_key(|event| event.key());
         Ok(ready)
@@ -310,10 +560,17 @@ impl EventDispatcher {
 
     pub fn remove_key(&mut self, key: EventKey) {
         self.registrations.remove(&key);
+        self.cancel_timeout(key);
     }
 
     pub fn clear_registrations(&mut self) {
         self.registrations.clear();
+        self.timers.clear();
+        self.raw_sources.get_mut().clear();
+    }
+
+    pub fn registration_count(&self) -> usize {
+        self.registrations.len()
     }
 
     pub fn interests(&self, key: EventKey) -> Option<EventInterest> {
@@ -333,11 +590,23 @@ impl EventRegistrar for EventDispatcher {
         if owner.trim().is_empty() {
             return Err(Error::Event("event source owner must not be empty".into()));
         }
-        let key = EventKey(self.next_key);
-        self.next_key = self
-            .next_key
-            .checked_add(1)
-            .ok_or_else(|| Error::Event("event key space exhausted".into()))?;
+        let key = loop {
+            let candidate = EventKey(self.next_key);
+            self.next_key = self
+                .next_key
+                .checked_add(1)
+                .ok_or_else(|| Error::Event("event key space exhausted".into()))?;
+            if self
+                .raw_sources
+                .borrow()
+                .contains_key(&Token(candidate.raw()))
+                || candidate.raw() == usize::MAX - 1
+                || candidate.raw() == usize::MAX
+            {
+                continue;
+            }
+            break candidate;
+        };
         self.poll
             .registry()
             .register(source, Token(key.raw()), interests.into_mio())
@@ -437,46 +706,41 @@ where
 #[derive(Clone)]
 pub struct EventLoopHandle {
     stop_requested: Arc<AtomicBool>,
-    waker: Arc<Waker>,
+    wake: EventPostHandle,
 }
 
 impl EventLoopHandle {
     pub fn stop(&self) {
         self.stop_requested.store(true, Ordering::Release);
-        let _ = self.waker.wake();
+        let _ = self.wake.wake();
     }
 }
 
+/// Compatibility facade for the original raw-mio API.
+///
+/// The worker-facing `EventDispatcher` is now the single poller and owns the
+/// waker, posted-command queue, timers, and registration lifecycle. This
+/// facade only translates raw mio registration/callbacks for older embedders.
 pub struct EventLoop {
-    poll: Poll,
-    events: Events,
+    dispatcher: EventDispatcher,
     handle: EventLoopHandle,
 }
 
 impl EventLoop {
     pub fn new(capacity: usize) -> Result<Self> {
-        if capacity == 0 {
-            return Err(Error::Event(
-                "event capacity must be greater than zero".into(),
-            ));
-        }
-        let poll = Poll::new().map_err(|error| Error::Event(error.to_string()))?;
-        let waker = Arc::new(
-            Waker::new(poll.registry(), STOP_TOKEN)
-                .map_err(|error| Error::Event(error.to_string()))?,
-        );
+        let dispatcher = EventDispatcher::new(capacity)?;
+        let wake = dispatcher.post_handle();
         Ok(Self {
-            poll,
-            events: Events::with_capacity(capacity),
+            dispatcher,
             handle: EventLoopHandle {
                 stop_requested: Arc::new(AtomicBool::new(false)),
-                waker,
+                wake,
             },
         })
     }
 
     pub fn registry(&self) -> &Registry {
-        self.poll.registry()
+        self.dispatcher.registry()
     }
 
     pub fn stop_handle(&self) -> EventLoopHandle {
@@ -493,12 +757,8 @@ impl EventLoop {
         token: Token,
         interests: Interest,
     ) -> Result<()> {
-        if token == STOP_TOKEN {
-            return Err(Error::Event("the stop token is reserved".into()));
-        }
-        self.registry()
-            .register(source, token, interests)
-            .map_err(|error| Error::Event(error.to_string()))
+        self.dispatcher
+            .register_raw_source(source, token, interests)
     }
 
     pub fn reregister<S: Source + ?Sized>(
@@ -507,18 +767,12 @@ impl EventLoop {
         token: Token,
         interests: Interest,
     ) -> Result<()> {
-        if token == STOP_TOKEN {
-            return Err(Error::Event("the stop token is reserved".into()));
-        }
-        self.registry()
-            .reregister(source, token, interests)
-            .map_err(|error| Error::Event(error.to_string()))
+        self.dispatcher
+            .reregister_raw_source(source, token, interests)
     }
 
     pub fn deregister<S: Source + ?Sized>(&self, source: &mut S) -> Result<()> {
-        self.registry()
-            .deregister(source)
-            .map_err(|error| Error::Event(error.to_string()))
+        self.dispatcher.deregister_raw_source(source)
     }
 
     pub fn run<H: EventHandler>(&mut self, handler: &mut H) -> Result<()> {
@@ -526,14 +780,8 @@ impl EventLoop {
             if self.handle.stop_requested.load(Ordering::Acquire) {
                 return Ok(());
             }
-            self.poll
-                .poll(&mut self.events, None)
-                .map_err(|error| Error::Event(error.to_string()))?;
-            for event in self.events.iter() {
-                if event.token() == STOP_TOKEN {
-                    continue;
-                }
-                handler.on_event(event)?;
+            for event in self.dispatcher.poll_raw(None)? {
+                handler.on_event(&event)?;
                 if self.handle.stop_requested.load(Ordering::Acquire) {
                     return Ok(());
                 }

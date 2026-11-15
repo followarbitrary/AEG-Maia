@@ -49,6 +49,7 @@ fn worker_sends_ready_after_config_and_metadata_then_stops_on_quit() {
         generation_id: 1,
         worker_id: 0,
         listeners: Vec::new(),
+        listener_owners: Default::default(),
         entrypoint: Some("internal-worker".into()),
     };
     let mut child = Command::new(env!("CARGO_BIN_EXE_aeg-maia"))
@@ -81,6 +82,7 @@ fn worker_rejects_listener_metadata_that_does_not_match_config() {
             name: "other".into(),
             fd: -1,
         }],
+        listener_owners: Default::default(),
         entrypoint: Some("internal-worker".into()),
     };
     let config = b"[worker]\nprogram='/bin/worker'\ncount=1\n[[listen]]\nname='main'\naddress='127.0.0.1:8080'\n";
@@ -111,6 +113,7 @@ fn worker_rejects_an_invalid_fd_for_a_claimed_listener_before_ready() {
             name: "main".into(),
             fd: -1,
         }],
+        listener_owners: Default::default(),
         entrypoint: Some("internal-worker".into()),
     };
     let config = b"[worker]\nprogram='/bin/worker'\ncount=1\n[[listen]]\nname='main'\naddress='127.0.0.1:8080'\n";
@@ -156,6 +159,7 @@ fn worker_net_module_accepts_an_inherited_listener() {
             name: "main".into(),
             fd,
         }],
+        listener_owners: Default::default(),
         entrypoint: Some("internal-worker".into()),
     };
     let mut child = Command::new(env!("CARGO_BIN_EXE_aeg-maia"))

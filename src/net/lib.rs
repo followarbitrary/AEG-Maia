@@ -7,12 +7,13 @@ use std::{
     collections::{HashMap, VecDeque},
     io::{self, Read, Write},
     net::SocketAddr,
+    time::Duration,
 };
 
 use mio::net::{TcpListener, TcpStream};
 
 use crate::{
-    accept_loop,
+    config::WorkerNetConfig,
     error::{Error, NetError, Result},
     event::{EventContext, EventInterest, EventKey, EventRegistrar, ModuleEvent},
     module::{ListenSpec, Module, ModuleContext, WorkerContext, WorkerModule},
@@ -56,6 +57,14 @@ impl Default for NetConfig {
 }
 
 impl NetConfig {
+    pub fn from_worker_config(config: &WorkerNetConfig) -> Self {
+        Self {
+            max_write_queue: config.max_write_queue,
+            high_watermark: config.high_watermark,
+            low_watermark: config.low_watermark,
+        }
+    }
+
     fn validate(self) -> Result<()> {
         if self.max_write_queue == 0
             || self.low_watermark > self.high_watermark
@@ -67,13 +76,36 @@ impl NetConfig {
     }
 }
 
+/// The write side of a connection made available to protocol callbacks.
+pub trait ConnectionWriter {
+    fn write(&mut self, bytes: &[u8]) -> Result<()>;
+}
+
 pub trait ConnHandler: Send {
     fn on_accept(&mut self, _id: ConnectionId, _peer: SocketAddr) -> Result<()> {
         Ok(())
     }
 
+    fn on_accept_with_writer(
+        &mut self,
+        id: ConnectionId,
+        peer: SocketAddr,
+        _writer: &mut dyn ConnectionWriter,
+    ) -> Result<()> {
+        self.on_accept(id, peer)
+    }
+
     fn on_read(&mut self, _id: ConnectionId, _data: &[u8]) -> Result<()> {
         Ok(())
+    }
+
+    fn on_read_with_writer(
+        &mut self,
+        id: ConnectionId,
+        data: &[u8],
+        _writer: &mut dyn ConnectionWriter,
+    ) -> Result<()> {
+        self.on_read(id, data)
     }
 
     fn on_read_eof(&mut self, _id: ConnectionId) -> Result<()> {
@@ -103,11 +135,48 @@ struct Connection {
     state: ConnectionState,
 }
 
+struct ConnectionQueueWriter<'a> {
+    connection: &'a mut Connection,
+    total_queued_bytes: &'a mut usize,
+    max_write_queue: usize,
+    max_total_write_queue: usize,
+}
+
+impl ConnectionWriter for ConnectionQueueWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        if bytes.len()
+            > self
+                .max_write_queue
+                .saturating_sub(self.connection.queued_bytes)
+        {
+            return Err(NetError::QueueFull.into());
+        }
+        if bytes.len()
+            > self
+                .max_total_write_queue
+                .saturating_sub(*self.total_queued_bytes)
+        {
+            return Err(NetError::QueueFull.into());
+        }
+        if !bytes.is_empty() {
+            self.connection.queue.push_back(bytes.to_vec());
+            self.connection.queued_bytes += bytes.len();
+            *self.total_queued_bytes += bytes.len();
+        }
+        Ok(())
+    }
+}
+
 pub struct NetService<H: ConnHandler> {
     owner: String,
     draining: bool,
     handler: H,
     config: NetConfig,
+    max_read_buffer: usize,
+    max_total_write_queue: usize,
+    total_queued_bytes: usize,
+    idle_timeout: Option<Duration>,
+    write_timeout: Option<Duration>,
     next_id: ConnectionId,
     listeners: HashMap<EventKey, Listener>,
     connections: HashMap<ConnectionId, Connection>,
@@ -121,6 +190,11 @@ impl<H: ConnHandler> NetService<H> {
             draining: false,
             handler,
             config,
+            max_read_buffer: 16 * 1024,
+            max_total_write_queue: 8 * 1024 * 1024,
+            total_queued_bytes: 0,
+            idle_timeout: None,
+            write_timeout: None,
             next_id: 1,
             listeners: HashMap::new(),
             connections: HashMap::new(),
@@ -134,6 +208,28 @@ impl<H: ConnHandler> NetService<H> {
 
     pub fn set_draining(&mut self, draining: bool) {
         self.draining = draining;
+    }
+
+    pub fn set_max_read_buffer(&mut self, max_read_buffer: usize) -> Result<()> {
+        if max_read_buffer == 0 {
+            return Err(Error::Net(NetError::InvalidReadBuffer));
+        }
+        self.max_read_buffer = max_read_buffer;
+        Ok(())
+    }
+
+    pub fn set_max_total_write_queue(&mut self, max_total_write_queue: usize) -> Result<()> {
+        if max_total_write_queue == 0 || self.total_queued_bytes > max_total_write_queue {
+            return Err(Error::Net(NetError::QueueFull));
+        }
+        self.max_total_write_queue = max_total_write_queue;
+        Ok(())
+    }
+
+    pub fn set_timeouts(&mut self, idle_timeout_secs: u64, write_timeout_secs: u64) {
+        self.idle_timeout = (idle_timeout_secs > 0).then(|| Duration::from_secs(idle_timeout_secs));
+        self.write_timeout =
+            (write_timeout_secs > 0).then(|| Duration::from_secs(write_timeout_secs));
     }
 
     pub fn attach_registered_listener(
@@ -200,19 +296,36 @@ impl<H: ConnHandler> NetService<H> {
         if self.draining || context.is_draining() {
             return Ok(());
         }
-        let mut accepted = Vec::new();
-        {
-            let listener = self
-                .listeners
-                .get_mut(&key)
-                .ok_or_else(|| Error::Event(format!("unknown listener key: {}", key.raw())))?;
-            accept_loop(&mut listener.socket, |stream, peer| {
-                accepted.push((stream, peer));
-                Ok(())
-            })?;
-        }
-        for (stream, peer) in accepted {
-            self.add_connection(stream, peer, context)?;
+        loop {
+            let accepted = {
+                let listener = self
+                    .listeners
+                    .get_mut(&key)
+                    .ok_or_else(|| Error::Event(format!("unknown listener key: {}", key.raw())))?;
+                listener.socket.accept()
+            };
+            match accepted {
+                Ok((stream, peer)) => self.add_connection(stream, peer, context)?,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                #[cfg(unix)]
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EMFILE) | Some(libc::ENFILE)
+                    ) =>
+                {
+                    // Keep the listener registered and retry after the next
+                    // readiness notification; a transient descriptor limit
+                    // must not discard already accepted connections.
+                    break;
+                }
+                // A process-wide descriptor exhaustion condition should be
+                // surfaced so the event loop can apply its normal error
+                // policy, while already accepted connections remain owned by
+                // the service.
+                Err(error) => return Err(Error::Event(error.to_string())),
+            }
         }
         Ok(())
     }
@@ -246,8 +359,26 @@ impl<H: ConnHandler> NetService<H> {
                 },
             },
         );
-        if self.handler.on_accept(id, peer).is_err() {
-            self.close_internal(id, CloseReason::HandlerError, context);
+        let callback_result = {
+            let (connections, handler) = (&mut self.connections, &mut self.handler);
+            let connection = connections
+                .get_mut(&id)
+                .expect("connection inserted before accept callback");
+            let mut writer = ConnectionQueueWriter {
+                connection,
+                total_queued_bytes: &mut self.total_queued_bytes,
+                max_write_queue: self.config.max_write_queue,
+                max_total_write_queue: self.max_total_write_queue,
+            };
+            handler.on_accept_with_writer(id, peer, &mut writer)
+        };
+        if let Err(error) = callback_result {
+            let reason = matches!(error, Error::Net(NetError::QueueFull))
+                .then_some(CloseReason::Overflow)
+                .unwrap_or(CloseReason::HandlerError);
+            self.close_internal(id, reason, context);
+        } else {
+            self.update_interest(id, context)?;
         }
         Ok(())
     }
@@ -258,25 +389,53 @@ impl<H: ConnHandler> NetService<H> {
         event: ModuleEvent,
         context: &mut EventContext<'_>,
     ) -> Result<()> {
+        if event.is_timeout() {
+            self.close_internal(id, CloseReason::Timeout, context);
+            return Ok(());
+        }
         if event.is_error() {
             self.close_internal(id, CloseReason::Reset, context);
             return Ok(());
         }
 
-        let mut chunks = Vec::new();
         let mut eof = false;
         if event.is_readable() || event.is_hup() {
-            let Some(connection) = self.connections.get_mut(&id) else {
-                return Ok(());
-            };
-            let mut buffer = [0_u8; 16 * 1024];
+            let mut buffer = vec![0_u8; self.max_read_buffer];
             loop {
-                match connection.socket.read(&mut buffer) {
+                let read_result = {
+                    let Some(connection) = self.connections.get_mut(&id) else {
+                        return Ok(());
+                    };
+                    connection.socket.read(&mut buffer)
+                };
+                match read_result {
                     Ok(0) => {
                         eof = true;
                         break;
                     }
-                    Ok(length) => chunks.push(buffer[..length].to_vec()),
+                    Ok(length) => {
+                        let callback_result = {
+                            let (connections, handler) = (&mut self.connections, &mut self.handler);
+                            let connection = connections
+                                .get_mut(&id)
+                                .expect("connection remains during read callback");
+                            let mut writer = ConnectionQueueWriter {
+                                connection,
+                                total_queued_bytes: &mut self.total_queued_bytes,
+                                max_write_queue: self.config.max_write_queue,
+                                max_total_write_queue: self.max_total_write_queue,
+                            };
+                            handler.on_read_with_writer(id, &buffer[..length], &mut writer)
+                        };
+                        if let Err(error) = callback_result {
+                            let reason = matches!(error, Error::Net(NetError::QueueFull))
+                                .then_some(CloseReason::Overflow)
+                                .unwrap_or(CloseReason::HandlerError);
+                            self.close_internal(id, reason, context);
+                            return Ok(());
+                        }
+                        self.update_interest(id, context)?;
+                    }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(_) => {
@@ -284,13 +443,6 @@ impl<H: ConnHandler> NetService<H> {
                         return Ok(());
                     }
                 }
-            }
-        }
-
-        for chunk in chunks {
-            if self.handler.on_read(id, &chunk).is_err() {
-                self.close_internal(id, CloseReason::HandlerError, context);
-                return Ok(());
             }
         }
 
@@ -356,6 +508,7 @@ impl<H: ConnHandler> NetService<H> {
                 Ok(length) => {
                     front.drain(..length);
                     connection.queued_bytes -= length;
+                    self.total_queued_bytes = self.total_queued_bytes.saturating_sub(length);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -384,21 +537,47 @@ impl<H: ConnHandler> NetService<H> {
             }
             EventInterest::readable_writable()
         };
-        context.reregister_source_for(connection.key, &mut connection.socket, interest)
+        let key = connection.key;
+        let has_pending_write = !connection.queue.is_empty();
+        context.reregister_source_for(key, &mut connection.socket, interest)?;
+        let timeout = if has_pending_write {
+            self.write_timeout.or(self.idle_timeout)
+        } else {
+            self.idle_timeout
+        };
+        if let Some(timeout) = timeout {
+            context.schedule_timeout_for(key, timeout)
+        } else {
+            context.cancel_timeout_for(key)?;
+            Ok(())
+        }
     }
 
     pub fn write(&mut self, id: ConnectionId, bytes: &[u8]) -> Result<()> {
         self.config.validate()?;
-        let connection = self
+        let queued_bytes = self
             .connections
-            .get_mut(&id)
-            .ok_or(NetError::UnknownConnection(id))?;
-        if bytes.len() > self.config.max_write_queue - connection.queued_bytes {
+            .get(&id)
+            .ok_or(NetError::UnknownConnection(id))?
+            .queued_bytes;
+        if bytes.len() > self.config.max_write_queue - queued_bytes {
+            return Err(NetError::QueueFull.into());
+        }
+        if bytes.len()
+            > self
+                .max_total_write_queue
+                .saturating_sub(self.total_queued_bytes)
+        {
             return Err(NetError::QueueFull.into());
         }
         if !bytes.is_empty() {
+            let connection = self
+                .connections
+                .get_mut(&id)
+                .expect("connection checked before enqueue");
             connection.queue.push_back(bytes.to_vec());
             connection.queued_bytes += bytes.len();
+            self.total_queued_bytes += bytes.len();
         }
         Ok(())
     }
@@ -470,6 +649,9 @@ impl<H: ConnHandler> NetService<H> {
         let Some(mut connection) = self.connections.remove(&id) else {
             return;
         };
+        self.total_queued_bytes = self
+            .total_queued_bytes
+            .saturating_sub(connection.queued_bytes);
         self.connection_keys.remove(&connection.key);
         let _ = context.deregister_source_for(connection.key, &mut connection.socket);
         let _ = self.handler.on_close(id, reason);
@@ -559,6 +741,40 @@ impl<H: ConnHandler> NetWorker<H> {
         }
     }
 
+    /// Construct a worker whose listener is supplied by the core's claim
+    /// handoff during `init_process`.
+    pub fn new_unbound(
+        module_name: impl Into<String>,
+        listener_name: impl Into<String>,
+        handler: H,
+        config: NetConfig,
+    ) -> Self {
+        let module_name = module_name.into();
+        Self {
+            listener_name: listener_name.into(),
+            service: NetService::new(module_name, handler, config),
+            listener: None,
+        }
+    }
+
+    /// Construct a worker whose listener is transferred by `claim_tcp` during
+    /// worker initialization. This is the preferred path for inherited
+    /// descriptors; the compatibility constructor above accepts a listener
+    /// directly for embedders that already own one.
+    pub fn from_claim(
+        module_name: impl Into<String>,
+        listener_name: impl Into<String>,
+        handler: H,
+        config: NetConfig,
+    ) -> Self {
+        let module_name = module_name.into();
+        Self {
+            listener_name: listener_name.into(),
+            service: NetService::new(module_name, handler, config),
+            listener: None,
+        }
+    }
+
     pub fn service(&self) -> &NetService<H> {
         &self.service
     }
@@ -570,7 +786,20 @@ impl<H: ConnHandler> NetWorker<H> {
 
 impl<H: ConnHandler> WorkerModule for NetWorker<H> {
     fn init_process(&mut self, ctx: &mut WorkerContext<'_>) -> Result<()> {
-        ctx.claim_listener(&self.listener_name)
+        self.service
+            .set_max_read_buffer(ctx.snapshot.worker.net.max_read_buffer)?;
+        self.service
+            .set_max_total_write_queue(ctx.snapshot.worker.net.max_total_write_queue)?;
+        self.service.set_timeouts(
+            ctx.snapshot.worker.net.idle_timeout_secs,
+            ctx.snapshot.worker.net.write_timeout_secs,
+        );
+        if self.listener.is_some() {
+            ctx.claim_listener(&self.listener_name)
+        } else {
+            self.listener = Some(ctx.claim_tcp(&self.listener_name)?);
+            Ok(())
+        }
     }
 
     fn register_events(&mut self, ctx: &mut WorkerContext<'_>) -> Result<()> {

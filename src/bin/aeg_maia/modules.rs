@@ -3,11 +3,6 @@ use aeg_maia::{
     NetModule, NetWorker, Result, WorkerModule, WorkerModuleFactory,
 };
 
-#[cfg(unix)]
-use std::os::fd::FromRawFd;
-
-use mio::net::TcpListener;
-
 #[derive(Clone, Copy, Default)]
 struct ReferenceConnHandler;
 
@@ -23,36 +18,18 @@ impl WorkerModuleFactory for ReferenceWorkerFactory {
         _worker_id: u32,
         snapshot: &ConfigSnapshot,
     ) -> Result<Box<dyn WorkerModule>> {
-        let index = snapshot
+        let listener = snapshot
             .listeners
             .iter()
-            .position(|listener| listener.name == name)
+            .find(|listener| listener.name == name)
             .ok_or_else(|| {
                 aeg_maia::Error::Module(format!("unknown reference net module: {name}"))
             })?;
-        let listener = &snapshot.listeners[index];
-        let fd = snapshot
-            .worker
-            .listener_fds
-            .get(index)
-            .copied()
-            .ok_or_else(|| {
-                aeg_maia::Error::Process(format!("listener {} has no inherited fd", listener.name))
-            })?;
-        if fd < 0 {
-            return Err(aeg_maia::Error::Process(format!(
-                "listener {} has invalid inherited fd {}",
-                listener.name, fd
-            )));
-        }
-        let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
-        let socket = TcpListener::from_std(std_listener);
-        Ok(Box::new(NetWorker::new(
+        Ok(Box::new(NetWorker::new_unbound(
             name,
             listener.name.clone(),
-            socket,
             ReferenceConnHandler,
-            NetConfig::default(),
+            NetConfig::from_worker_config(&snapshot.worker.net),
         )))
     }
 }

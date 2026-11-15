@@ -4,7 +4,7 @@ mod unix_master {
         collections::VecDeque,
         fs::OpenOptions,
         io::Write,
-        net::TcpListener,
+        net::{SocketAddr, TcpListener, ToSocketAddrs},
         os::fd::{AsRawFd, FromRawFd},
         path::{Path, PathBuf},
         process::{Command, Stdio},
@@ -22,6 +22,7 @@ mod unix_master {
 
     struct Logger {
         file: Option<std::fs::File>,
+        path: Option<PathBuf>,
     }
 
     impl Logger {
@@ -35,7 +36,31 @@ mod unix_master {
                         .map_err(|error| Error::Process(error.to_string()))
                 })
                 .transpose()?;
-            Ok(Self { file })
+            Ok(Self {
+                file,
+                path: path.map(Path::to_path_buf),
+            })
+        }
+
+        fn reopen(&mut self, path: Option<&Path>) -> Result<()> {
+            let next_path = path.map(Path::to_path_buf);
+            self.file = next_path
+                .as_deref()
+                .map(|path| {
+                    OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .map_err(|error| Error::Process(error.to_string()))
+                })
+                .transpose()?;
+            self.path = next_path;
+            Ok(())
+        }
+
+        fn reopen_current(&mut self) -> Result<()> {
+            let path = self.path.clone();
+            self.reopen(path.as_deref())
         }
 
         fn line(&mut self, message: impl AsRef<str>) {
@@ -61,11 +86,7 @@ mod unix_master {
             let mut sockets = Vec::with_capacity(specs.len());
             let mut entries = Vec::with_capacity(specs.len());
             for listener in specs {
-                let socket = TcpListener::bind(&listener.address)
-                    .map_err(|error| Error::Process(error.to_string()))?;
-                socket
-                    .set_nonblocking(true)
-                    .map_err(|error| Error::Process(error.to_string()))?;
+                let socket = bind_listener(listener)?;
                 let fd = socket.as_raw_fd();
                 entries.push((listener.name.clone(), listener.address.clone(), fd));
                 sockets.push(socket);
@@ -122,6 +143,88 @@ mod unix_master {
         fn manifest(&self) -> &str {
             &self.manifest
         }
+    }
+
+    fn bind_listener(spec: &ListenSpec) -> Result<TcpListener> {
+        let address = spec
+            .address
+            .to_socket_addrs()
+            .map_err(|error| Error::Process(error.to_string()))?
+            .next()
+            .ok_or_else(|| Error::Process(format!("listener {} has no address", spec.name)))?;
+        let domain = match address {
+            SocketAddr::V4(_) => libc::AF_INET,
+            SocketAddr::V6(_) => libc::AF_INET6,
+        };
+        let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            return Err(Error::Process(std::io::Error::last_os_error().to_string()));
+        }
+        let failed = |message: String| {
+            unsafe { libc::close(fd) };
+            Error::Process(message)
+        };
+        if spec.reuse_port {
+            let enabled: libc::c_int = 1;
+            let result = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_REUSEPORT,
+                    (&enabled as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&enabled) as libc::socklen_t,
+                )
+            };
+            if result < 0 {
+                return Err(failed(std::io::Error::last_os_error().to_string()));
+            }
+        }
+        let result = match address {
+            SocketAddr::V4(address) => {
+                let mut sockaddr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                sockaddr.sin_family = libc::AF_INET as libc::sa_family_t;
+                sockaddr.sin_port = address.port().to_be();
+                sockaddr.sin_addr = libc::in_addr {
+                    s_addr: u32::from_ne_bytes(address.ip().octets()),
+                };
+                unsafe {
+                    libc::bind(
+                        fd,
+                        (&sockaddr as *const libc::sockaddr_in).cast(),
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    )
+                }
+            }
+            SocketAddr::V6(address) => {
+                let mut sockaddr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+                sockaddr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                sockaddr.sin6_port = address.port().to_be();
+                sockaddr.sin6_flowinfo = address.flowinfo();
+                sockaddr.sin6_scope_id = address.scope_id();
+                sockaddr.sin6_addr = libc::in6_addr {
+                    s6_addr: address.ip().octets(),
+                };
+                unsafe {
+                    libc::bind(
+                        fd,
+                        (&sockaddr as *const libc::sockaddr_in6).cast(),
+                        std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                    )
+                }
+            }
+        };
+        if result < 0 {
+            return Err(failed(std::io::Error::last_os_error().to_string()));
+        }
+        let backlog = spec.backlog.clamp(1, libc::c_int::MAX as u32) as libc::c_int;
+        if unsafe { libc::listen(fd, backlog) } < 0 {
+            return Err(failed(std::io::Error::last_os_error().to_string()));
+        }
+        let socket = unsafe { TcpListener::from_raw_fd(fd) };
+        socket
+            .set_nonblocking(true)
+            .map_err(|error| Error::Process(error.to_string()))?;
+        Ok(socket)
     }
 
     type Manager = GenerationManager<CommandWorkerFactory>;
@@ -279,10 +382,25 @@ mod unix_master {
                 .pop_front()
                 .or_else(|| platform::SignalSource::try_recv(&mut signals))
             else {
-                thread::sleep(Duration::from_millis(20));
+                if let Err(error) =
+                    platform::SignalSource::wait(&mut signals, Duration::from_millis(20))
+                {
+                    cleanup_after_fatal(&mut manager, &pid_file);
+                    return Err(Error::Process(error));
+                }
                 continue;
             };
             match signal {
+                platform::ControlSignal::Usr1 => {
+                    if let Err(error) =
+                        logger.reopen(cli.log.as_deref().or(initial.master.log_file.as_deref()))
+                    {
+                        logger.line(format!("log reopen failed: {error}"));
+                    }
+                    if let Err(error) = manager.reopen_logs() {
+                        logger.line(format!("worker log reopen failed: {error}"));
+                    }
+                }
                 platform::ControlSignal::Hup => {
                     if let Err(error) = reload(
                         &mut manager,
@@ -301,7 +419,8 @@ mod unix_master {
                         cleanup_after_fatal(&mut manager, &pid_file);
                         return Err(error);
                     }
-                    if let Err(error) = wait_for_retirement(&mut manager, &mut logger) {
+                    if let Err(error) = wait_for_retirement(&mut manager, &mut logger, &mut signals)
+                    {
                         cleanup_after_fatal(&mut manager, &pid_file);
                         return Err(error);
                     }
@@ -323,6 +442,8 @@ mod unix_master {
                         &listeners,
                         &mut manager,
                         &mut logger,
+                        &mut signals,
+                        initial.generation.handoff_timeout_secs,
                         pid_file.as_ref(),
                         effective_pid_path.as_deref(),
                     ) {
@@ -376,7 +497,11 @@ mod unix_master {
         }
     }
 
-    fn wait_for_retirement(manager: &mut Manager, logger: &mut Logger) -> Result<()> {
+    fn wait_for_retirement(
+        manager: &mut Manager,
+        logger: &mut Logger,
+        signals: &mut platform::UnixSignalSource,
+    ) -> Result<()> {
         loop {
             for event in manager.tick(Instant::now())? {
                 let retired = matches!(event, ProcessEvent::GenerationRetired(_));
@@ -385,7 +510,21 @@ mod unix_master {
                     return Ok(());
                 }
             }
-            thread::sleep(Duration::from_millis(20));
+            while let Some(signal) = platform::SignalSource::try_recv(signals) {
+                match signal {
+                    platform::ControlSignal::Usr1 => {
+                        logger.reopen_current()?;
+                    }
+                    platform::ControlSignal::Term | platform::ControlSignal::Int => {
+                        logger.line(format!("signal {signal:?} escalates graceful retirement"));
+                        manager.force_shutdown()?;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+            platform::SignalSource::wait(signals, Duration::from_millis(20))
+                .map_err(Error::Process)?;
         }
     }
 
@@ -422,7 +561,8 @@ mod unix_master {
                 }
             }
             drain_busy_signals(signals, deferred_signals, logger);
-            thread::sleep(Duration::from_millis(20));
+            platform::SignalSource::wait(signals, Duration::from_millis(20))
+                .map_err(Error::Process)?;
         }
     }
 
@@ -433,7 +573,9 @@ mod unix_master {
     ) {
         while let Some(signal) = platform::SignalSource::try_recv(signals) {
             match signal {
-                platform::ControlSignal::Hup | platform::ControlSignal::Usr2 => {
+                platform::ControlSignal::Hup
+                | platform::ControlSignal::Usr1
+                | platform::ControlSignal::Usr2 => {
                     logger.line(format!(
                         "signal {signal:?} rejected while reload is in progress"
                     ));
@@ -445,11 +587,14 @@ mod unix_master {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_successor(
         cli: &Cli,
         listeners: &BoundListeners,
         manager: &mut Manager,
         logger: &mut Logger,
+        signals: &mut platform::UnixSignalSource,
+        handoff_timeout_secs: u64,
         pid_file: Option<&platform::PidFile>,
         pid_path: Option<&Path>,
     ) -> Result<()> {
@@ -479,17 +624,29 @@ mod unix_master {
             .spawn()
             .map_err(|error| Error::Process(error.to_string()))?;
         drop(writer);
-        let ready = reader
-            .wait(Duration::from_secs(10))
-            .map_err(|error| Error::Process(error.to_string()))?;
-        if !ready {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(Error::Process("USR2 successor did not report ready".into()));
+        let ready = reader.wait(Duration::from_secs(handoff_timeout_secs));
+        match ready {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(pid_file) = pid_file {
+                    let _ = pid_file.restore_after_failed_handoff();
+                }
+                return Err(Error::Process("USR2 successor did not report ready".into()));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(pid_file) = pid_file {
+                    let _ = pid_file.restore_after_failed_handoff();
+                }
+                return Err(Error::Process(error.to_string()));
+            }
         }
         logger.line("USR2 successor ready; draining old master");
         manager.shutdown()?;
-        wait_for_retirement(manager, logger)
+        wait_for_retirement(manager, logger, signals)
     }
 
     fn cleanup_after_fatal(manager: &mut Manager, pid_file: &Option<platform::PidFile>) {

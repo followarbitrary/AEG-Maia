@@ -6,8 +6,6 @@ use std::{
     os::unix::fs::MetadataExt,
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
-    thread,
     time::Duration,
 };
 
@@ -20,6 +18,7 @@ pub struct PidFile {
     _file: File,
     device: u64,
     inode: u64,
+    pid: u32,
 }
 
 #[cfg(unix)]
@@ -48,7 +47,28 @@ impl PidFile {
             _file: file,
             device: metadata.dev(),
             inode: metadata.ino(),
+            pid,
         })
+    }
+
+    /// Restore the old master's pid after a successor replaced the path but
+    /// failed before committing readiness. The caller must have stopped the
+    /// failed successor first so its pid-file lock is no longer held.
+    pub fn restore_after_failed_handoff(&self) -> PlatformResult<()> {
+        let current = fs::read_to_string(&self.path).unwrap_or_default();
+        if current.trim() == self.pid.to_string() {
+            return Ok(());
+        }
+        let new_path = self.path.with_extension("pid.new");
+        let _ = fs::remove_file(&new_path);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&new_path)
+            .map_err(|error| error.to_string())?;
+        writeln!(file, "{}", self.pid).map_err(|error| error.to_string())?;
+        file.flush().map_err(|error| error.to_string())?;
+        fs::rename(&new_path, &self.path).map_err(|error| error.to_string())
     }
 
     #[cfg(test)]
@@ -94,6 +114,7 @@ impl PidFile {
             _file: file,
             device: metadata.dev(),
             inode: metadata.ino(),
+            pid,
         })
     }
 
@@ -101,7 +122,11 @@ impl PidFile {
         let Ok(metadata) = fs::metadata(&self.path) else {
             return Ok(());
         };
-        if metadata.dev() == self.device && metadata.ino() == self.inode {
+        let same_inode = metadata.dev() == self.device && metadata.ino() == self.inode;
+        let restored_owner = fs::read_to_string(&self.path)
+            .ok()
+            .is_some_and(|contents| contents.trim() == self.pid.to_string());
+        if same_inode || restored_owner {
             fs::remove_file(&self.path).map_err(|error| error.to_string())?;
         }
         Ok(())
@@ -245,6 +270,7 @@ pub enum ControlSignal {
     Quit,
     Term,
     Int,
+    Usr1,
     Usr2,
 }
 
@@ -256,6 +282,7 @@ impl ControlSignal {
             libc::SIGQUIT => Some(Self::Quit),
             libc::SIGTERM => Some(Self::Term),
             libc::SIGINT => Some(Self::Int),
+            libc::SIGUSR1 => Some(Self::Usr1),
             libc::SIGUSR2 => Some(Self::Usr2),
             _ => None,
         }
@@ -265,11 +292,20 @@ impl ControlSignal {
 #[cfg(unix)]
 pub trait SignalSource: Send {
     fn try_recv(&mut self) -> Option<ControlSignal>;
+
+    /// Block until a signal is readable or the timeout expires.  The default
+    /// implementation keeps custom sources source-compatible while the Unix
+    /// adapter uses its self-pipe as a pollable wakeup source.
+    fn wait(&mut self, timeout: Duration) -> PlatformResult<()> {
+        std::thread::sleep(timeout);
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
 pub struct UnixSignalSource {
-    receiver: Receiver<i32>,
+    readers: Vec<(ControlSignal, UnixStream)>,
+    registrations: Vec<signal_hook::SigId>,
 }
 
 #[cfg(unix)]
@@ -280,22 +316,75 @@ impl UnixSignalSource {
             libc::SIGQUIT,
             libc::SIGTERM,
             libc::SIGINT,
+            libc::SIGUSR1,
             libc::SIGUSR2,
         ];
         set_signal_mask(&signal_numbers, libc::SIG_BLOCK).map_err(|error| error.to_string())?;
-        let signals = signal_hook::iterator::Signals::new(signal_numbers)
-            .map_err(|error| error.to_string())?;
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let _ = set_signal_mask(&signal_numbers, libc::SIG_UNBLOCK);
-            let mut signals = signals;
-            for signal in signals.forever() {
-                if sender.send(signal).is_err() {
-                    break;
+        let mut readers = Vec::with_capacity(signal_numbers.len());
+        let mut registrations = Vec::with_capacity(signal_numbers.len());
+        for raw_signal in signal_numbers {
+            let signal = ControlSignal::from_raw(raw_signal)
+                .expect("all configured signals have a ControlSignal mapping");
+            let (reader, writer) = UnixStream::pair().map_err(|error| error.to_string())?;
+            reader
+                .set_nonblocking(true)
+                .map_err(|error| error.to_string())?;
+            let registration = match signal_hook::low_level::pipe::register(raw_signal, writer) {
+                Ok(registration) => registration,
+                Err(error) => {
+                    for registration in registrations.drain(..) {
+                        let _ = signal_hook::low_level::unregister(registration);
+                    }
+                    return Err(error.to_string());
                 }
+            };
+            readers.push((signal, reader));
+            registrations.push(registration);
+        }
+        // Signals are blocked while installing the handlers so no event can
+        // be lost between registration and the first poll.  The master then
+        // unblocks them on its event-loop thread; the async-signal-safe
+        // handler writes one byte to the corresponding self-pipe.
+        if let Err(error) = set_signal_mask(&signal_numbers, libc::SIG_UNBLOCK) {
+            for registration in registrations.drain(..) {
+                let _ = signal_hook::low_level::unregister(registration);
             }
-        });
-        Ok(Self { receiver })
+            return Err(error.to_string());
+        }
+        Ok(Self {
+            readers,
+            registrations,
+        })
+    }
+
+    pub fn wait(&mut self, timeout: Duration) -> PlatformResult<()> {
+        let mut poll_fds = self
+            .readers
+            .iter()
+            .map(|(_, reader)| libc::pollfd {
+                fd: reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect::<Vec<_>>();
+        let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        let result = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, timeout_ms) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error.to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixSignalSource {
+    fn drop(&mut self) {
+        for registration in self.registrations.drain(..) {
+            let _ = signal_hook::low_level::unregister(registration);
+        }
     }
 }
 
@@ -321,10 +410,22 @@ fn set_signal_mask(signals: &[i32], how: i32) -> io::Result<()> {
 #[cfg(unix)]
 impl SignalSource for UnixSignalSource {
     fn try_recv(&mut self) -> Option<ControlSignal> {
-        self.receiver
-            .try_recv()
-            .ok()
-            .and_then(ControlSignal::from_raw)
+        for (signal, reader) in &mut self.readers {
+            let mut byte = [0_u8; 1];
+            match reader.read(&mut byte) {
+                Ok(1) => return Some(*signal),
+                Ok(0) => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => continue,
+                _ => continue,
+            }
+        }
+        None
+    }
+
+    fn wait(&mut self, timeout: Duration) -> PlatformResult<()> {
+        UnixSignalSource::wait(self, timeout)
     }
 }
 
@@ -382,7 +483,9 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{ControlSignal, ListenerFdSet, PidFile, ReadinessPipe};
+    use super::{
+        ControlSignal, ListenerFdSet, PidFile, ReadinessPipe, SignalSource, UnixSignalSource,
+    };
 
     #[cfg(unix)]
     #[test]
@@ -396,6 +499,19 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "22\n");
         owner.remove_if_owner().unwrap();
         assert!(path.exists(), "old pid owner must not remove successor pid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_handoff_restores_old_pid_and_cleanup_ownership() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("aeg.pid");
+        let owner = PidFile::acquire(&path, 11).unwrap();
+        owner.write_new_and_replace(22).unwrap();
+        owner.restore_after_failed_handoff().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "11\n");
+        owner.remove_if_owner().unwrap();
+        assert!(!path.exists());
     }
 
     #[cfg(unix)]
@@ -452,6 +568,20 @@ mod tests {
             ControlSignal::from_raw(libc::SIGUSR2),
             Some(ControlSignal::Usr2)
         );
+        assert_eq!(
+            ControlSignal::from_raw(libc::SIGUSR1),
+            Some(ControlSignal::Usr1)
+        );
         assert_eq!(ControlSignal::from_raw(libc::SIGPIPE), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_source_wakes_from_self_pipe_without_a_receiver_thread() {
+        let mut source = UnixSignalSource::new().unwrap();
+        assert_eq!(source.try_recv(), None);
+        assert_eq!(unsafe { libc::raise(libc::SIGUSR1) }, 0);
+        SignalSource::wait(&mut source, Duration::from_secs(1)).unwrap();
+        assert_eq!(source.try_recv(), Some(ControlSignal::Usr1));
     }
 }

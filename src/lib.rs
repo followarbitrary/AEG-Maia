@@ -15,6 +15,7 @@ pub mod event;
 pub mod memory;
 #[path = "module/lib.rs"]
 pub mod module;
+#[cfg(feature = "net")]
 #[path = "net/lib.rs"]
 pub mod net;
 #[path = "process/lib.rs"]
@@ -23,25 +24,29 @@ pub mod process;
 pub use config::{
     ConfigManager, ConfigSnapshot, ConfigSource, GenerationConfig, ListenConfig, MasterConfig,
     OnAllFailed, PoolConfig, RestartConfig, RuntimeConfig, TomlConfigSource, WorkerConfig,
+    WorkerNetConfig,
 };
 pub use error::{Error, NetError, Result};
 pub use event::{
     accept_loop, EventContext, EventDispatcher, EventHandler, EventInterest, EventKey, EventLoop,
-    EventLoopHandle, EventRegistrar, ModuleEvent,
+    EventLoopHandle, EventPostHandle, EventRegistrar, ModuleEvent,
 };
-pub use memory::{Pool, PoolFactory, PoolGuard};
+pub use memory::{Exhausted, Pool, PoolFactory, PoolGuard, PoolStats};
 pub use module::{
     ListenSpec, ListenerClaims, Module, ModuleContext, ModuleCycle, ModuleOrder, ModuleRegistry,
     ServiceRegistry, WorkerContext, WorkerEventRegistrar, WorkerEventRegistry, WorkerModule,
     WorkerModuleFactory,
 };
+#[cfg(feature = "net")]
 pub use net::{
-    CloseReason, ConnHandler, ConnectionId, ConnectionState, NetConfig, NetModule, NetService,
-    NetWorker,
+    CloseReason, ConnHandler, ConnectionId, ConnectionState, ConnectionWriter, NetConfig,
+    NetModule, NetService, NetWorker,
 };
+#[cfg(unix)]
+pub use process::SocketPairControlChannelFactory;
 pub use process::{
     CommandWorkerFactory, ControlChannel, ControlFrameCodec, ExitStatus, FrameKind, GenerationId,
     GenerationManager, GenerationState, ListenerMetadata, ModuleRegistryFactory,
-    PipeControlChannelFactory, ProcessEvent, WorkerCommand, WorkerEvent, WorkerFactory,
-    WorkerHandle, WorkerId, WorkerMetadata, WorkerSpawnRequest, MAX_FRAME_BYTES,
+    PipeControlChannelFactory, ProcessEvent, ProcessKind, WorkerCommand, WorkerEvent,
+    WorkerFactory, WorkerHandle, WorkerId, WorkerMetadata, WorkerSpawnRequest, MAX_FRAME_BYTES,
 };

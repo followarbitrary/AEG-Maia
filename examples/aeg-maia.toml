@@ -5,6 +5,15 @@ daemon = false
 program = "aeg-maia"
 count = 1
 
+[worker.net]
+max_write_queue = 1048576
+max_read_buffer = 16384
+max_total_write_queue = 8388608
+high_watermark = 786432
+low_watermark = 262144
+idle_timeout_secs = 0
+write_timeout_secs = 0
+
 [memory]
 initial = 1
 soft_max = 8
@@ -16,6 +25,7 @@ min_ready = 1
 ready_timeout_secs = 10
 drain_timeout_secs = 30
 kill_timeout_secs = 5
+handoff_timeout_secs = 10
 max_draining = 2
 on_all_failed = "exit"
 

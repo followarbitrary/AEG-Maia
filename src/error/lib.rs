@@ -10,6 +10,8 @@ pub enum NetError {
     QueueFull,
     #[error("invalid write queue watermarks")]
     InvalidWatermarks,
+    #[error("invalid read buffer limit")]
+    InvalidReadBuffer,
 }
 
 #[derive(Debug, Error)]
